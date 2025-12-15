@@ -1,0 +1,44 @@
+# Build artifacts
+dist/
+build/
+*.dll
+*.so
+*.obj
+*.o
+*.exe
+
+# Intermediate files
+*.def
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# Visual Studio files
+.vs/
+*.vcxproj.user
+*.sln.docstates
+
+# GCC/MinGW
+*.a
+*.d
+
+# Temporary files
+*~
+*.swp
+*.bak
+*.tmp
+
+# IDE files
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
