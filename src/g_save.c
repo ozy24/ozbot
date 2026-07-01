@@ -19,6 +19,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 #include "g_local.h"
+#include "bot.h"
 
 #define Function(f) {#f, f}
 
@@ -205,6 +206,9 @@ void InitGame (void)
 
 	// items
 	InitItems ();
+
+	// ozbot
+	Bot_Init ();
 
 	Com_sprintf (game.helpmessage1, sizeof(game.helpmessage1), "");
 

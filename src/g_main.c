@@ -19,6 +19,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 #include "g_local.h"
+#include "bot.h"
 
 game_locals_t	game;
 level_locals_t	level;
@@ -93,6 +94,8 @@ void G_RunFrame (void);
 void ShutdownGame (void)
 {
 	gi.dprintf ("==== ShutdownGame ====\n");
+
+	Bot_Shutdown ();
 
 	gi.FreeTags (TAG_LEVEL);
 	gi.FreeTags (TAG_GAME);
@@ -368,6 +371,11 @@ void G_RunFrame (void)
 		ExitLevel ();
 		return;
 	}
+
+	// ozbot: drive bots before the entity loop so each bot's ClientThink
+	// runs before ClientBeginServerFrame processes its buttons, mirroring
+	// how the engine delivers real client commands.
+	Bot_RunFrame ();
 
 	//
 	// treat each object in turn
