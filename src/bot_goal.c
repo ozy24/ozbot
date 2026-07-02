@@ -20,9 +20,16 @@ value * need / distance; the best becomes the bot's goal.
 // re-fixate on it (and so multiple bots spread across items)
 static float	item_cooldown[MAX_EDICTS];
 
+// consecutive giveups at each item (any bot).  Items bots keep failing to
+// reach get an escalating shared blacklist (bot_itemfail): the graph may
+// claim a route the bots can't actually execute (vertically-gated spots),
+// and each such attempt burns the full goal budget.
+static byte		item_fails[MAX_EDICTS];
+
 void Goal_Reset (void)
 {
 	memset (item_cooldown, 0, sizeof(item_cooldown));
+	memset (item_fails, 0, sizeof(item_fails));
 }
 
 /*
@@ -56,8 +63,45 @@ void Goal_Blacklist (edict_t *it, float secs)
 	if (!it)
 		return;
 	n = it - g_edicts;
-	if (n >= 0 && n < MAX_EDICTS)
+	// max-keeping: the short spread-cooldown Bot_GoExplore applies on every
+	// goal exit must not shorten an escalated failure blacklist
+	if (n >= 0 && n < MAX_EDICTS && level.time + secs > item_cooldown[n])
 		item_cooldown[n] = level.time + secs;
+}
+
+/*
+=================
+Goal_ItemFailed / Goal_ItemSucceeded
+
+Track consecutive giveups per item.  A giveup means a bot committed its full
+goal budget and still couldn't touch the item, so make everyone avoid it for
+an escalating while (20/40/80/160s); any successful collection resets it.
+=================
+*/
+void Goal_ItemFailed (edict_t *it)
+{
+	int n;
+	if (!it || bot_itemfail->value == 0)
+		return;
+	n = it - g_edicts;
+	if (n < 0 || n >= MAX_EDICTS)
+		return;
+	if (item_fails[n] < 4)
+		item_fails[n]++;
+	Goal_Blacklist (it, BOT_ITEM_COOLDOWN * (float)(1 << item_fails[n]));
+}
+
+void Goal_ItemSucceeded (edict_t *it)
+{
+	int n;
+	if (!it)
+		return;
+	n = it - g_edicts;
+	if (n >= 0 && n < MAX_EDICTS)
+	{
+		item_fails[n] = 0;
+		item_cooldown[n] = 0;	// proven collectable; drop any failure blacklist
+	}
 }
 
 static qboolean Goal_OnCooldown (edict_t *it)

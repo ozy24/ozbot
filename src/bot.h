@@ -12,6 +12,10 @@ Every .c file that includes bot.h must include "g_local.h" first.
 
 #define BOT_MAX_PATH	128
 
+// base per-item avoidance after a bot abandons it (bot_main.c goal exits and
+// bot_goal.c's escalating failure blacklist both build on this)
+#define BOT_ITEM_COOLDOWN	10.0f
+
 // bot behavior mode
 #define BOT_MODE_EXPLORE	0	// wander, growing the nav graph
 #define BOT_MODE_GOAL		1	// follow an A* path to a goal node
@@ -98,6 +102,8 @@ extern cvar_t	*bot_rollout;
 extern cvar_t	*bot_claim;
 extern cvar_t	*bot_pathcost;
 extern cvar_t	*bot_goalbudget;
+extern cvar_t	*bot_budgetcap;
+extern cvar_t	*bot_itemfail;
 
 //
 // bot_move.c -- steering (target point / path following -> usercmd_t)
@@ -144,6 +150,8 @@ qboolean Goal_ItemAvailable (edict_t *it);
 qboolean Goal_IsRecovery (edict_t *it);	// health or armor pickup?
 edict_t *Goal_NearestItem (bot_t *b, float maxdist);	// for directed exploration
 void Goal_Blacklist (edict_t *it, float secs);	// avoid re-targeting briefly
+void Goal_ItemFailed (edict_t *it);		// giveup at an item: escalate avoidance
+void Goal_ItemSucceeded (edict_t *it);	// collected: reset failure tracking
 void Goal_Reset (void);					// clear cooldowns (map change)
 void Goal_SeedNavNodes (void);			// seed nav nodes at item spots
 

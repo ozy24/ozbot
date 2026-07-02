@@ -29,6 +29,8 @@ cvar_t	*bot_rollout;
 cvar_t	*bot_claim;
 cvar_t	*bot_pathcost;
 cvar_t	*bot_goalbudget;
+cvar_t	*bot_budgetcap;
+cvar_t	*bot_itemfail;
 
 // registry indexed by client slot (index i <-> g_edicts[i+1])
 static bot_t	bots[MAX_CLIENTS];
@@ -37,14 +39,15 @@ static char		bot_logged_map[MAX_QPATH];	// map the current log/nav is for
 
 #define BOT_GRAPH_READY		24		// nodes needed before goal-seeking starts
 #define BOT_GOAL_TIMEOUT	12.0f	// abandon a goal not reached within this
-#define BOT_ITEM_COOLDOWN	10.0f	// how long to avoid a failed item
 
 // bot_goalbudget: timeout scaled to the committed route's A* cost instead of
 // the flat BOT_GOAL_TIMEOUT -- short hops recycle faster, honest long routes
 // get funded.  base + cost/speed crosses the flat 12s at cost ~600u.
+// The cap comes from the bot_budgetcap cvar (default 15): pickups p95 is
+// ~11s, so budget past that mostly funds giveups, not successes.
 #define BOT_GOAL_BUDGET_BASE	6.0f	// seconds of slack regardless of route
 #define BOT_GOAL_BUDGET_SPEED	100.0f	// effective travel speed (cost units/sec)
-#define BOT_GOAL_BUDGET_MAX		20.0f	// never fund a route longer than this
+#define BOT_GOAL_BUDGET_MAX		20.0f	// cap fallback if bot_budgetcap <= 0
 
 /*
 =================
@@ -63,6 +66,8 @@ void Bot_Init (void)
 	bot_claim        = gi.cvar ("bot_claim", "1", 0);
 	bot_pathcost     = gi.cvar ("bot_pathcost", "1", 0);	// score items by A* route cost, not straight-line distance
 	bot_goalbudget   = gi.cvar ("bot_goalbudget", "1", 0);	// goal timeout scaled to route cost, not flat 12s
+	bot_budgetcap    = gi.cvar ("bot_budgetcap", "15", 0);	// max seconds to fund any one goal route
+	bot_itemfail     = gi.cvar ("bot_itemfail", "1", 0);	// escalating shared blacklist for items bots keep failing
 	bot_skilltest    = gi.cvar ("bot_skilltest", "0", 0);
 	bot_lead         = gi.cvar ("bot_lead", "1", 0);		// lead moving targets by projectile flight time
 	bot_leadtest     = gi.cvar ("bot_leadtest", "0", 0);	// head-to-head: even bot ids lead, odd don't
@@ -443,6 +448,7 @@ static void Bot_Navigate (bot_t *b)
 				VectorSubtract (b->goal_item->s.origin, ent->s.origin, dv);
 				dd = VectorLength (dv);
 				Bot_LogItemEvent (b, (dd < 96) ? "pickup" : "item_lost", nm);
+				Goal_ItemSucceeded (b->goal_item);	// either way, someone collected it
 				Bot_GoExplore (b);
 				Bot_Wander (b);
 				return;
@@ -454,9 +460,10 @@ static void Bot_Navigate (bot_t *b)
 			float budget = BOT_GOAL_TIMEOUT;
 			if (bot_goalbudget->value != 0 && b->goal_cost > 0)
 			{
+				float cap = (bot_budgetcap->value > 0) ? bot_budgetcap->value : BOT_GOAL_BUDGET_MAX;
 				budget = BOT_GOAL_BUDGET_BASE + b->goal_cost / BOT_GOAL_BUDGET_SPEED;
-				if (budget > BOT_GOAL_BUDGET_MAX)
-					budget = BOT_GOAL_BUDGET_MAX;
+				if (budget > cap)
+					budget = cap;
 			}
 			if (level.time - b->goal_time > budget)
 			{
@@ -471,6 +478,8 @@ static void Bot_Navigate (bot_t *b)
 			VectorSubtract (tgt, ent->s.origin, d);
 			Bot_LogGiveup (b, (float)sqrt(d[0]*d[0] + d[1]*d[1]), d[2],
 				atnode, b->enemy ? 1 : 0);
+			if (b->goal_item)
+				Goal_ItemFailed (b->goal_item);
 			Bot_GoExplore (b);
 			Bot_Wander (b);
 			return;
