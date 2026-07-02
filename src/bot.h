@@ -93,6 +93,7 @@ extern cvar_t	*bot_forwardspeed;
 extern cvar_t	*bot_debug;
 extern cvar_t	*bot_rollout;
 extern cvar_t	*bot_claim;
+extern cvar_t	*bot_pathcost;
 
 //
 // bot_move.c -- steering (target point / path following -> usercmd_t)

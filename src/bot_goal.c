@@ -13,6 +13,9 @@ value * need / distance; the best becomes the bot's goal.
 #include "bot.h"
 #include "bot_nav.h"
 
+// distance falloff shared by naive (straight-line) and path-cost scoring
+#define GOAL_DIST_FALLOFF	512.0f
+
 // per-item cooldown so bots that fail/abandon an item don't immediately
 // re-fixate on it (and so multiple bots spread across items)
 static float	item_cooldown[MAX_EDICTS];
@@ -164,7 +167,7 @@ static float Item_Score (bot_t *b, edict_t *it, float *out_dist)
 
 	// keep goals local enough to actually reach (chasing far items just exposes
 	// nav-to-item precision limits and inflates timeouts)
-	falloff = 512.0f;
+	falloff = GOAL_DIST_FALLOFF;
 	return value * need / (1.0f + dist / falloff);
 }
 
@@ -218,6 +221,7 @@ qboolean Goal_Select (bot_t *b)
 {
 	edict_t	*cand[GOAL_MAX_CAND];
 	float	score[GOAL_MAX_CAND];
+	float	sldist[GOAL_MAX_CAND];
 	byte	timing[GOAL_MAX_CAND];
 	byte	rejected[GOAL_MAX_CAND];
 	int		ncand = 0;
@@ -270,6 +274,7 @@ qboolean Goal_Select (bot_t *b)
 
 		cand[ncand] = it;
 		score[ncand] = s;
+		sldist[ncand] = dist;
 		timing[ncand] = tm;
 		rejected[ncand] = 0;
 		ncand++;
@@ -279,31 +284,63 @@ qboolean Goal_Select (bot_t *b)
 		return false;
 
 	// ---- pick the best-scoring item we can actually path to ----
+	// bot_pathcost 0: take the first reachable candidate in naive score order.
+	// bot_pathcost 1: spend the same bounded set of A* checks, but re-rank the
+	// reachable candidates by what the route *really* costs (A* g-cost, which
+	// carries the jump/fall/water link multipliers), so an item behind a lift
+	// or long detour stops out-scoring an easier one that's farther as the
+	// crow flies.
 	start = Nav_NearestNode (b->ent->s.origin);
-	for (tries = 0; tries < GOAL_MAX_TRIES; tries++)
 	{
-		int		best = -1;
-		float	bestscore = 0;
-		int		node, len;
+		int		pickcand = -1;
+		float	pickscore = 0;
 
-		for (i = 0; i < ncand; i++)
-			if (!rejected[i] && score[i] > bestscore)
-			{
-				bestscore = score[i];
-				best = i;
-			}
-		if (best < 0)
-			break;
-
-		node = Nav_NearestNode (cand[best]->s.origin);
-		len = Nav_FindPath (start, node, pathbuf, BOT_MAX_PATH);
-		if (len > 0)
+		for (tries = 0; tries < GOAL_MAX_TRIES; tries++)
 		{
-			b->goal_item = cand[best];
-			b->goal_timing = timing[best];
+			int		best = -1;
+			float	bestscore = 0;
+			int		node, len;
+
+			for (i = 0; i < ncand; i++)
+				if (!rejected[i] && score[i] > bestscore)
+				{
+					bestscore = score[i];
+					best = i;
+				}
+			if (best < 0)
+				break;
+			rejected[best] = 1;	// consumed (reachable or not)
+
+			node = Nav_NearestNode (cand[best]->s.origin);
+			len = Nav_FindPath (start, node, pathbuf, BOT_MAX_PATH);
+			if (len <= 0)
+				continue;		// unreachable from here; try the next best
+
+			if (bot_pathcost->value == 0)
+			{
+				b->goal_item = cand[best];
+				b->goal_timing = timing[best];
+				return true;
+			}
+
+			// recover value*need from the naive score, re-divide by path cost
+			{
+				float	s = score[best] * (1.0f + sldist[best] / GOAL_DIST_FALLOFF)
+							/ (1.0f + Nav_LastPathCost () / GOAL_DIST_FALLOFF);
+				if (s > pickscore)
+				{
+					pickscore = s;
+					pickcand = best;
+				}
+			}
+		}
+
+		if (pickcand >= 0)
+		{
+			b->goal_item = cand[pickcand];
+			b->goal_timing = timing[pickcand];
 			return true;
 		}
-		rejected[best] = 1;	// unreachable from here; try the next best
 	}
 
 	return false;	// nothing reachable

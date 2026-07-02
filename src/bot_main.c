@@ -26,6 +26,7 @@ cvar_t	*bot_debug;
 cvar_t	*bot_seed;
 cvar_t	*bot_rollout;
 cvar_t	*bot_claim;
+cvar_t	*bot_pathcost;
 
 // registry indexed by client slot (index i <-> g_edicts[i+1])
 static bot_t	bots[MAX_CLIENTS];
@@ -50,6 +51,7 @@ void Bot_Init (void)
 	bot_seed         = gi.cvar ("bot_seed", "0", 0);
 	bot_rollout      = gi.cvar ("bot_rollout", "1", 0);
 	bot_claim        = gi.cvar ("bot_claim", "1", 0);
+	bot_pathcost     = gi.cvar ("bot_pathcost", "1", 0);	// score items by A* route cost, not straight-line distance
 	bot_skilltest    = gi.cvar ("bot_skilltest", "0", 0);
 
 	// Seed the game's RNG.  The vanilla game never calls srand(), so every

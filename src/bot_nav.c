@@ -365,6 +365,13 @@ A* from start to goal over node centers.  Writes the node sequence (including
 both endpoints) into out[] and returns its length, or 0 if unreachable.
 =================
 */
+static float	nav_path_cost;	// g-cost of the last successful Nav_FindPath
+
+float Nav_LastPathCost (void)
+{
+	return nav_path_cost;
+}
+
 int Nav_FindPath (int start, int goal, int *out, int max)
 {
 	static float	gscore[NAV_MAX_NODES];
@@ -375,11 +382,13 @@ int Nav_FindPath (int start, int goal, int *out, int max)
 	int		i, count;
 	int		tmp[NAV_MAX_NODES];
 
+	nav_path_cost = 1e18f;
 	if (start < 0 || goal < 0 || start >= nav.num_nodes || goal >= nav.num_nodes)
 		return 0;
 	if (start == goal)
 	{
 		if (max > 0) out[0] = start;
+		nav_path_cost = 0;
 		return (max > 0) ? 1 : 0;
 	}
 
@@ -447,6 +456,7 @@ int Nav_FindPath (int start, int goal, int *out, int max)
 
 	for (i = 0; i < count; i++)
 		out[i] = tmp[count - 1 - i];
+	nav_path_cost = gscore[goal];
 	return count;
 }
 

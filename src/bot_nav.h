@@ -70,6 +70,7 @@ int  Nav_SeedNode (vec3_t origin);					// ensure+connect a node here
 int  Nav_NearestNode (vec3_t origin);				// nearest node, or -1
 int  Nav_NearestVisibleNode (vec3_t origin, edict_t *ignore);	// nearest with a clear walk, or -1
 int  Nav_FindPath (int start, int goal, int *out, int max);	// A*; returns node count
+float Nav_LastPathCost (void);						// g-cost of the last successful A*
 void Nav_PenalizeLink (int from, int to);			// learn an untraversable edge
 qboolean Nav_CanWalk (vec3_t from, vec3_t to, edict_t *ignore);	// clear player-sized path?
 
