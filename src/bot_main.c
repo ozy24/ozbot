@@ -24,6 +24,7 @@ cvar_t	*bot_count;
 cvar_t	*bot_forwardspeed;
 cvar_t	*bot_debug;
 cvar_t	*bot_seed;
+cvar_t	*bot_quitafter;
 cvar_t	*bot_rollout;
 cvar_t	*bot_claim;
 cvar_t	*bot_pathcost;
@@ -57,6 +58,7 @@ void Bot_Init (void)
 	bot_debug        = gi.cvar ("bot_debug", "0", 0);
 	bot_skill        = gi.cvar ("bot_skill", "0.6", 0);
 	bot_seed         = gi.cvar ("bot_seed", "0", 0);
+	bot_quitafter    = gi.cvar ("bot_quitafter", "0", 0);	// >0: quit after N game seconds (times fastsim runs)
 	bot_rollout      = gi.cvar ("bot_rollout", "1", 0);
 	bot_claim        = gi.cvar ("bot_claim", "1", 0);
 	bot_pathcost     = gi.cvar ("bot_pathcost", "1", 0);	// score items by A* route cost, not straight-line distance
@@ -708,6 +710,24 @@ void Bot_RunFrame (void)
 
 	if (!deathmatch->value)
 		return;
+
+	// bot_quitafter: quit the server after N *game* seconds.  This is how
+	// fastsim runs are timed (run_parallel.py --fastsim): the patched engine is
+	// CPU-bound with no per-tick sleep, so a server that never quits pins a
+	// core at 100% forever -- the quit MUST come from game time, not wall
+	// time.  ShutdownGame saves the nav graph on the way out.
+	if (bot_quitafter->value > 0 && level.time >= bot_quitafter->value)
+	{
+		static qboolean quitting;
+		if (!quitting)
+		{
+			quitting = true;
+			gi.dprintf ("ozbot: bot_quitafter %g reached, quitting\n",
+				bot_quitafter->value);
+			gi.AddCommandString ("quit\n");
+		}
+		return;
+	}
 
 	// new map?  the engine wiped g_edicts; save the old graph, reset, and
 	// start fresh logging + nav for the new map.

@@ -93,6 +93,7 @@ qboolean Bot_ItemClaimed (edict_t *it, bot_t *self);
 extern cvar_t	*bot_count;
 extern cvar_t	*bot_forwardspeed;
 extern cvar_t	*bot_debug;
+extern cvar_t	*bot_quitafter;
 extern cvar_t	*bot_rollout;
 extern cvar_t	*bot_claim;
 extern cvar_t	*bot_pathcost;

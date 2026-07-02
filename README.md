@@ -45,9 +45,13 @@ whichever makes real progress.
 
 ## The measurement loop
 
-The dedicated server runs ~real time, so throughput comes from parallelism: the standard rig is
-**8 headless servers × 90 seconds × 5 bots**, each worker on an isolated gamedir with a fixed RNG
-seed (`bot_seed`), merged into one telemetry set. Per-tick JSONL telemetry feeds an analyzer that
+Throughput comes from two levers: a patched dedicated engine (`q2proded_fast.exe`, built from the
+`q2pro/` source by `build_engine.bat`) whose `fastsim` cvar removes the per-tick sleep so the sim
+runs CPU-bound at **hundreds of × real time**, and parallelism on top. The standard rig is
+**8 headless servers × 90 *game*-seconds × 5 bots** (`run_parallel.bat --fastsim`, a couple of
+wall-seconds end-to-end), each worker on an isolated gamedir with a fixed RNG seed (`bot_seed`),
+merged into one telemetry set. Fastsim is bit-exact: with the same seed it reproduces the
+real-time engine's telemetry byte-for-byte, just faster. Per-tick JSONL telemetry feeds an analyzer that
 reports per-bot movement/goals/pickups/frags, failure clustering, and a coverage/failure heatmap.
 
 - The headline navigation metric is **ITEM completion**: pickups ÷ item-goal attempts.
@@ -78,6 +82,9 @@ learn q2dm3 from scratch. The skill model is confirmed real: skill 0.9 bots get 
 kills** than skill 0.1 bots fighting in the same matches (6-seed id-parity test). **Projectile
 target-leading** (`bot_lead`) moved the leading population's kill ratio from 0.81 to 1.27
 (~57% relative gain, 6/6 seeds, paired id-parity test) — the largest combat improvement so far.
+**Fight-or-flight** (`bot_flee`: retreat while firing when clearly outmatched) added another
++23% relative kills with no nav cost — retreating breaks losing fights, so bots keep their
+weapons and re-engage on their own terms.
 
 ## What was tried and rejected (and why it matters)
 
@@ -93,6 +100,9 @@ knowledge, not failures to hide:
 | Ledge-jump primitive | flat, helped some seeds, hurt others | the vertical failures were 100–140u platforms, not single ledges |
 | Lift/vertical-arrival fix (4 architecturally distinct attempts) | lost or tied every time, even though pathing verifiably worked | finding routes ≠ completing them in-budget; the constraint was route *economics* |
 | Learned per-link traversal times | wash live; consistent loss when transplanted onto the canonical graph | measured costs only inflate (floor + frame quantization); static distance×type costs were already sufficient |
+| Soft-penalize claimed items instead of hard-skip | pooled loss, `item_lost` rose | contested items are contested for a reason |
+| Flee-and-fetch-health (abandon current goal when fleeing) | won combat but cost ~7 ITEM% points | the survival value is in the retreat movement, not the health fetch; goal churn is expensive |
+| Directed rocket dodging (2 variants, 16-seed A/Bs) | wash / slight loss | constant strafing already captures the dodge value; a directed override just disrupts it |
 
 The through-line: six locomotion-layer fixes failed before the real levers turned out to be
 **goal-selection contention** (bots with no mutual awareness converging on the same item) and
@@ -110,6 +120,7 @@ deploy.bat         :: copy dist/gamex86.dll -> %Q2DIR%/ozbot/
 run_server.bat     :: build + deploy + launch a dedicated server with bots
 play.bat           :: launch a listen server you can play IN against the bots
 run_parallel.bat   :: build + deploy + N parallel headless sims + merged analysis
+build_engine.bat   :: build ../q2pro (x86, meson) -> %Q2DIR%/q2proded_fast.exe (fastsim engine)
 ```
 
 `%Q2DIR%` points at a Quake II install (a q2pro engine dir with `baseq2` paks). The vanilla game
@@ -119,8 +130,12 @@ tooling (`analyze.py`, `run_parallel.py`, demo parsers — pure Python stdlib) l
 Typical A/B run:
 
 ```bat
-run_parallel.bat --instances 8 --seconds 90 --bots 5 --seed 200 --cvar bot_pathcost 0
+run_parallel.bat --fastsim --instances 8 --seconds 90 --bots 5 --seed 200 --cvar bot_pathcost 0
 ```
+
+With `--fastsim`, `--seconds` counts *simulated game seconds* (each server quits itself via
+`bot_quitafter`), so every seed simulates exactly the same game time; without it the servers run
+at real time and `--seconds` is wall-clock.
 
 ### Runtime knobs
 
@@ -133,10 +148,13 @@ run_parallel.bat --instances 8 --seconds 90 --bots 5 --seed 200 --cvar bot_pathc
 | `bot_claim` | 1 | skip items another bot is already going for |
 | `bot_rollout` | 1 | physics-forward rollout recovery when stuck |
 | `bot_lead` | 1 | lead moving targets by projectile flight time (skill-scaled) |
+| `bot_flee` | 1 | retreat (while firing) when clearly outmatched |
 | `bot_seed` | 0 | >0 = deterministic RNG for reproducible runs |
+| `bot_quitafter` | 0 | >0 = quit the server after N *game* seconds (timed fastsim runs) |
 | `bot_debug` | 0 | draw nav paths / enemy lines via temp-entity beams |
 | `bot_skilltest` | 0 | diagnostic: id-parity skill split (0.9 vs 0.1) within one match |
 | `bot_leadtest` | 0 | diagnostic: id-parity lead split (even ids lead, odd don't) |
+| `bot_fleetest` | 0 | diagnostic: id-parity flee split (even ids flee, odd don't) |
 
 Server console: `sv bot_add N` / `sv bot_remove N` / `sv bot_clear`. The learned graph is saved
 to `<gamedir>/nav/<map>.nav` (autosaved ~30s); telemetry to `<gamedir>/logs/<map>_<ts>.jsonl`.
