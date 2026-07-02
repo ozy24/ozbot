@@ -64,6 +64,8 @@ void Bot_Init (void)
 	bot_skilltest    = gi.cvar ("bot_skilltest", "0", 0);
 	bot_lead         = gi.cvar ("bot_lead", "1", 0);		// lead moving targets by projectile flight time
 	bot_leadtest     = gi.cvar ("bot_leadtest", "0", 0);	// head-to-head: even bot ids lead, odd don't
+	bot_flee         = gi.cvar ("bot_flee", "1", 0);		// retreat + fetch health/armor when outmatched
+	bot_fleetest     = gi.cvar ("bot_fleetest", "0", 0);	// head-to-head: even bot ids flee, odd don't
 
 	// Seed the game's RNG.  The vanilla game never calls srand(), so every
 	// process starts from the same default sequence -- which makes parallel
@@ -112,6 +114,7 @@ static void Bot_ResetNavState (bot_t *b)
 	b->goal_item = NULL;
 	b->goal_timing = false;
 	b->goal_cost = 0;
+	b->flee      = false;
 	b->path_len  = 0;
 	b->path_idx  = 0;
 	b->replan_time  = level.time + 1.0;
@@ -392,8 +395,19 @@ static void Bot_Navigate (bot_t *b)
 	stuck = Bot_UpdateStuck (b);
 
 	// ---- goal-seeking ----
+	// flee decay: combat only clears the flag while an enemy is visible, so
+	// once we've shaken the pursuer, drop it as soon as toughness is back
+	if (b->flee && !b->enemy && Combat_Strength (ent) > 80)
+		b->flee = false;
+
 	if (b->mode == BOT_MODE_GOAL && b->goal_node >= 0 && b->goal_node < nav.num_nodes)
 	{
+		// note: a fleeing bot deliberately does NOT abandon its current goal --
+		// that was tried and the abandon/blacklist/re-pick churn cost ~7 ITEM%
+		// points while contributing nothing measurable to survival (the escape
+		// comes from the retreat movement; flee only re-weights NEW goal picks
+		// toward health/armor via Item_Score)
+
 		// track closest approach to the goal node (diagnostics)
 		{
 			vec3_t	gd;

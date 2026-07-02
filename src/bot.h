@@ -65,6 +65,7 @@ typedef struct
 	float		reaction_until;	// earliest time we may fire after acquiring
 	float		dodge_until;	// when to re-pick a strafe direction
 	int			dodge_dir;		// -1 / +1 strafe
+	qboolean	flee;			// outmatched: retreat and fetch health/armor
 
 	// transition tracking for event logging
 	qboolean	was_dead;
@@ -126,16 +127,20 @@ void Bot_ApplyMovement (bot_t *b, usercmd_t *cmd, float facing_yaw);
 // Sets aim into *facing_yaw/*facing_pitch and the fire button into cmd; may
 // blend a strafe/range component into b->move_dir.  Returns true if engaged.
 qboolean Combat_Aim (bot_t *b, usercmd_t *cmd, float *facing_yaw, float *facing_pitch);
+float Combat_Strength (edict_t *e);	// effective toughness (health + armor)
 extern cvar_t	*bot_skill;
 extern cvar_t	*bot_skilltest;
 extern cvar_t	*bot_lead;
 extern cvar_t	*bot_leadtest;
+extern cvar_t	*bot_flee;
+extern cvar_t	*bot_fleetest;
 
 //
 // bot_goal.c -- item-driven goal selection
 //
 qboolean Goal_Select (bot_t *b);		// choose b->goal_item; true if found
 qboolean Goal_ItemAvailable (edict_t *it);
+qboolean Goal_IsRecovery (edict_t *it);	// health or armor pickup?
 edict_t *Goal_NearestItem (bot_t *b, float maxdist);	// for directed exploration
 void Goal_Blacklist (edict_t *it, float secs);	// avoid re-targeting briefly
 void Goal_Reset (void);					// clear cooldowns (map change)

@@ -13,6 +13,8 @@ cvar_t	*bot_skill;		// 0 (easy) .. 1 (hard)
 cvar_t	*bot_skilltest;	// head-to-head skill A/B; see Bot_Add in bot_main.c
 cvar_t	*bot_lead;		// lead moving targets by projectile flight time
 cvar_t	*bot_leadtest;	// head-to-head lead A/B: even bot ids lead, odd don't
+cvar_t	*bot_flee;		// retreat + fetch health/armor when clearly outmatched
+cvar_t	*bot_fleetest;	// head-to-head flee A/B: even bot ids flee, odd don't
 
 static float Skill (bot_t *b)
 {
@@ -128,6 +130,28 @@ static void Combat_SelectWeapon (bot_t *b)
 
 /*
 =================
+Combat_Strength
+
+Effective toughness for fight-or-flight comparisons: health plus armor at the
+armor system's rough absorption weight.
+=================
+*/
+float Combat_Strength (edict_t *e)
+{
+	float	s = e->health;
+	int		ai;
+
+	if (e->client)
+	{
+		ai = ArmorIndex (e);
+		if (ai)
+			s += e->client->pers.inventory[ai] * 0.5f;
+	}
+	return s;
+}
+
+/*
+=================
 Combat_ProjectileSpeed
 
 Muzzle speed of the current weapon's projectile, or 0 for hitscan weapons
@@ -177,6 +201,31 @@ qboolean Combat_Aim (bot_t *b, usercmd_t *cmd, float *facing_yaw, float *facing_
 		b->reaction_until = level.time + reaction;
 		b->aim[YAW]   = self->client->ps.viewangles[YAW];
 		b->aim[PITCH] = self->client->ps.viewangles[PITCH];
+	}
+
+	// fight-or-flight: when clearly outmatched, retreat (still firing) and let
+	// the goal layer fetch health/armor.  Hysteresis so it doesn't flap.
+	{
+		qboolean can_flee = (bot_fleetest->value != 0)
+			? ((b->id & 1) == 0)
+			: (bot_flee->value != 0);
+		if (!can_flee)
+			b->flee = false;
+		else
+		{
+			float mine   = Combat_Strength (self);
+			float theirs = Combat_Strength (enemy);
+			if (b->flee)
+			{
+				if (mine > 100 || mine > theirs * 0.95f)
+					b->flee = false;	// recovered (or they got hurt too)
+			}
+			else
+			{
+				if (mine < 75 && mine < theirs * 0.65f)
+					b->flee = true;
+			}
+		}
 	}
 
 	Combat_SelectWeapon (b);
@@ -236,12 +285,22 @@ qboolean Combat_Aim (bot_t *b, usercmd_t *cmd, float *facing_yaw, float *facing_
 	strafe[1] =  toenemy[0] * b->dodge_dir;
 	strafe[2] = 0;
 
-	// approach if far, back off if too close
-	rc = (range < 200) ? -0.8f : (range > 650) ? 0.6f : 0.0f;
+	// approach if far, back off if too close; when fleeing, always disengage
+	// (movement is decoupled from aim, so the bot retreats while firing back)
+	if (b->flee)
+	{
+		rc = -0.9f;
+		comb[0] = b->move_dir[0] * 1.0f + strafe[0] * 0.5f + toenemy[0] * rc;
+		comb[1] = b->move_dir[1] * 1.0f + strafe[1] * 0.5f + toenemy[1] * rc;
+	}
+	else
+	{
+		rc = (range < 200) ? -0.8f : (range > 650) ? 0.6f : 0.0f;
 
-	// nav goal (already in move_dir) + dodge + range adjustment
-	comb[0] = b->move_dir[0] * 0.7f + strafe[0] * 0.7f + toenemy[0] * rc;
-	comb[1] = b->move_dir[1] * 0.7f + strafe[1] * 0.7f + toenemy[1] * rc;
+		// nav goal (already in move_dir) + dodge + range adjustment
+		comb[0] = b->move_dir[0] * 0.7f + strafe[0] * 0.7f + toenemy[0] * rc;
+		comb[1] = b->move_dir[1] * 0.7f + strafe[1] * 0.7f + toenemy[1] * rc;
+	}
 	comb[2] = 0;
 	if (VectorLength (comb) < 0.1f)
 		VectorCopy (strafe, comb);

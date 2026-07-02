@@ -86,6 +86,25 @@ static qboolean has (const char *s, const char *sub)
 	return (s && sub && strstr (s, sub)) ? true : false;
 }
 
+/*
+=================
+Goal_IsRecovery
+
+True for pickups that restore toughness (health or armor) -- what a fleeing
+bot should be running for.
+=================
+*/
+qboolean Goal_IsRecovery (edict_t *it)
+{
+	gitem_t	*item = it ? it->item : NULL;
+	if (!item)
+		return false;
+	if (item->flags & IT_ARMOR)
+		return true;
+	return has (item->classname, "health")
+		|| has (item->pickup_name, "Health") || has (item->pickup_name, "health");
+}
+
 // base value at/above which an item is a "control" item: worth crossing the
 // map for and worth timing its respawn.  Value-driven so it adapts to whatever
 // items a map actually has (q2dm1 has no Red Armor/Mega/Quad -- here this picks
@@ -164,6 +183,10 @@ static float Item_Score (bot_t *b, edict_t *it, float *out_dist)
 
 	if (need <= 0)
 		return 0;
+
+	// a fleeing bot wants toughness back above everything else
+	if (b->flee && Goal_IsRecovery (it))
+		value *= 2.5f;
 
 	// keep goals local enough to actually reach (chasing far items just exposes
 	// nav-to-item precision limits and inflates timeouts)
