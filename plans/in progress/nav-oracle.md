@@ -139,6 +139,39 @@ PLAT tagging: gated, and worker gamedirs already isolate copies.
 
 ## Phase C — the oracle: principled reachability + return codes
 
+> **RESULT (2026-07-03): landed; acceptance passed; two discoveries.**
+> Behavior gate: tick stream md5-identical to baseline; giveup events
+> identical modulo the added `navq` field; reach records purely additive.
+> The load sweep reproduced the known q2dm1 truths with zero tuning:
+> **Railgun gated by water (cost 1226), GL/Chaingun/HyperBlaster gated by
+> plat, Megahealth no-path** (it is one of the "Health" no-path rows, on a
+> 2-node island with the Rockets ledge). `sv nav_query Railgun` works live.
+>
+> **Discovery 1 — seeded island nodes shadow real coverage.** 20 item spots
+> (all z >= 608: the upper deck, mega ledge, rail-pit ammo) sit on
+> Goal_SeedNavNodes islands with 0-2 links that never reconnect during play
+> (verified: 90 game-seconds changed load->quit verdicts barely). Because
+> the island sits exactly at the item, Nav_NearestNode always returns it, so
+> Goal_Select's A* targets the orphan and rejects the item -- those items
+> are only ever collected by explore-contact luck (RL: 3 goal commits in
+> 90s, all from bots already standing on the deck). A likely contributor to
+> "ITEM ceiling tracks map verticality". **Candidate next phase:** prefer a
+> connected node (in-links > 0) within range over an orphan when resolving
+> an item's nav node -- needs its own A/B, NOT bundled here.
+>
+> **Discovery 2 — giveups are execution failures, not stale routes.** The
+> `navq` enrichment shows 91-98% of giveups happen with a live route still
+> in the graph ("ok"); route evaporation is ~2%. So `bot_itemfail 2`
+> (fast-track the blacklist when the route is gone) is a practical no-op --
+> its A/B was byte-identical to control on 8 seeds. Kept as opt-in code,
+> default stays 1. This is direct evidence for the item-completion
+> bottleneck being locomotion execution, confirming the standing memory.
+>
+> Also added beyond the plan: the sweep runs at **quit** as well as load
+> (worker maturation is discarded, so the load sweep measures persisted-
+> graph staleness while the quit sweep measures the run's steady state),
+> and dropped weapons are excluded from sweeps.
+
 The `PathReturnCode` idea, pointed at our biggest diagnostic gap: today
 "unreachable" is inferred from giveup statistics after budget is burned.
 

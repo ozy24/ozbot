@@ -175,6 +175,7 @@ extern cvar_t	*bot_goalbudget;
 extern cvar_t	*bot_budgetcap;
 extern cvar_t	*bot_itemfail;
 extern cvar_t	*bot_navmask;
+extern cvar_t	*bot_reachlog;
 extern cvar_t	*bot_swim;
 extern cvar_t	*bot_lift;
 extern cvar_t	*bot_liftlog;
@@ -294,7 +295,11 @@ qboolean Goal_ItemAvailable (edict_t *it);
 qboolean Goal_IsRecovery (edict_t *it);	// health or armor pickup?
 edict_t *Goal_NearestItem (bot_t *b, float maxdist);	// for directed exploration
 void Goal_Blacklist (edict_t *it, float secs);	// avoid re-targeting briefly
-void Goal_ItemFailed (edict_t *it);		// giveup at an item: escalate avoidance
+// giveup at an item: escalate avoidance.  navq = the oracle's NAVQ_* verdict
+// at giveup time (bot_itemfail 2 fast-tracks route-evaporated items)
+void Goal_ItemFailed (edict_t *it, int navq);
+void Goal_ReachSweep (const char *when);	// bot_reachlog: item reachability sweep
+											// (when = "load" or "quit")
 void Goal_ItemSucceeded (edict_t *it);	// collected: reset failure tracking
 void Goal_Reset (void);					// clear cooldowns (map change)
 void Goal_SeedNavNodes (void);			// seed nav nodes at item spots
@@ -304,7 +309,11 @@ void Goal_SeedNavNodes (void);			// seed nav nodes at item spots
 //
 const char *Bot_GameDir (void);
 void Bot_LogItemEvent (bot_t *b, const char *event, const char *item);
-void Bot_LogGiveup (bot_t *b, float gdist, float gvdist, int atnode, int fighting);
+void Bot_LogGiveup (bot_t *b, float gdist, float gvdist, int atnode, int fighting,
+	const char *navq);	// navq: oracle verdict on the goal at giveup time
+// one reach-sweep record (bot_reachlog; plans/nav-oracle.md Phase C)
+void Bot_LogReach (const char *when, const char *item, const char *classname,
+	vec3_t org, const char *code, const char *gate, float cost);
 void Bot_LogBeginLevel (const char *mapname);	// open a fresh JSONL for this map
 void Bot_LogEndLevel (void);					// flush + close the current JSONL
 void Bot_LogTick (bot_t *b);					// per-tick state record

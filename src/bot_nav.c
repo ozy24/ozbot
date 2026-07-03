@@ -541,6 +541,101 @@ int Nav_FindPathMasked (int start, int goal, int mask, int *out, int max)
 	return count;
 }
 
+/*
+=================
+Nav_QueryPath
+
+The reachability oracle (plans/nav-oracle.md Phase C): classify whether 'to'
+is routable from 'from' under a capability mask, without committing a bot or
+a budget to finding out.  Read-only -- no graph mutation, no RNG.
+
+GATED means the full-capability graph routes it but 'mask' doesn't; *gate
+names the minimal unlocking link types (each missing type tried singly; if
+only a combination unlocks it, *gate is every missing type).  Node-proximity
+failures use the same 192u radius Goal_Select requires of item coverage.
+=================
+*/
+#define NAVQ_NEAR	192.0f
+
+int Nav_QueryPath (vec3_t from, vec3_t to, int mask, float *cost, int *gate)
+{
+	static int	buf[NAV_MAX_NODES];
+	int			start, goal, missing, t;
+
+	if (cost) *cost = 0;
+	if (gate) *gate = 0;
+
+	start = Nav_NearestNode (from);
+	if (start < 0 || Nav_Dist (nav.nodes[start].origin, from) > NAVQ_NEAR)
+		return NAVQ_NO_START_NODE;
+	goal = Nav_NearestNode (to);
+	if (goal < 0 || Nav_Dist (nav.nodes[goal].origin, to) > NAVQ_NEAR)
+		return NAVQ_NO_GOAL_NODE;
+
+	if (Nav_FindPathMasked (start, goal, mask, buf, NAV_MAX_NODES) > 0)
+	{
+		if (cost) *cost = nav_path_cost;
+		return NAVQ_OK;
+	}
+	if (mask == NAV_MASK_ALL
+		|| Nav_FindPathMasked (start, goal, NAV_MASK_ALL, buf, NAV_MAX_NODES) <= 0)
+		return NAVQ_NO_PATH;
+
+	if (cost)
+		*cost = nav_path_cost;	// what the full-capability route costs
+	missing = NAV_MASK_ALL & ~mask;
+	if (gate)
+	{
+		for (t = 0; t <= NAV_LINK_PLAT; t++)
+			if ((missing & NAV_MASK (t))
+				&& Nav_FindPathMasked (start, goal, mask | NAV_MASK (t), buf, NAV_MAX_NODES) > 0)
+				*gate |= NAV_MASK (t);
+		if (!*gate)
+			*gate = missing;	// only a combination of capabilities unlocks it
+	}
+	return NAVQ_GATED;
+}
+
+const char *Nav_QueryName (int code)
+{
+	switch (code)
+	{
+	case NAVQ_OK:				return "ok";
+	case NAVQ_GATED:			return "gated";
+	case NAVQ_NO_PATH:			return "no_path";
+	case NAVQ_NO_GOAL_NODE:		return "no_goal_node";
+	case NAVQ_NO_START_NODE:	return "no_start_node";
+	}
+	return "unknown";
+}
+
+/*
+=================
+Nav_MaskNames
+
+Link-type mask -> "water+plat" style string for logs/console.
+=================
+*/
+void Nav_MaskNames (int mask, char *out, int outsize)
+{
+	static const char *names[] = { "walk", "fall", "jump", "teleport", "water", "plat" };
+	int		t;
+
+	out[0] = 0;
+	for (t = 0; t <= NAV_LINK_PLAT; t++)
+	{
+		if (!(mask & NAV_MASK (t)))
+			continue;
+		if ((int)(strlen (out) + strlen (names[t]) + 2) > outsize)
+			break;	// callers pass >=40 bytes; every full mask fits
+		if (out[0])
+			strcat (out, "+");
+		strcat (out, names[t]);
+	}
+	if (!out[0])
+		Com_sprintf (out, outsize, "none");
+}
+
 //==========================================================================
 // persistence
 //==========================================================================

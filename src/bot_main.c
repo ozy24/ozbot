@@ -35,6 +35,7 @@ cvar_t	*bot_goalbudget;
 cvar_t	*bot_budgetcap;
 cvar_t	*bot_itemfail;
 cvar_t	*bot_navmask;
+cvar_t	*bot_reachlog;
 cvar_t	*bot_swim;
 cvar_t	*bot_lift;
 cvar_t	*bot_liftlog;
@@ -87,8 +88,11 @@ void Bot_Init (void)
 	bot_goalbudget   = gi.cvar ("bot_goalbudget", "1", 0);	// goal timeout scaled to route cost, not flat 12s
 	bot_budgetcap    = gi.cvar ("bot_budgetcap", "15", 0);	// max seconds to fund any one goal route
 	bot_itemfail     = gi.cvar ("bot_itemfail", "1", 0);	// escalating shared blacklist for items bots keep failing
+															// (2 = also fast-track items whose route evaporated, per
+															// the giveup-time oracle verdict; plans/nav-oracle.md)
 	bot_navmask      = gi.cvar ("bot_navmask", "0", 0);		// A* skips link types whose capability cvar is off
 															// (plans/nav-oracle.md Phase A)
+	bot_reachlog     = gi.cvar ("bot_reachlog", "1", 0);	// map-load item reachability sweep (oracle diagnostics)
 	bot_swim         = gi.cvar ("bot_swim", "1", 0);		// 3D steering in water (vertical swim + water-jump exits)
 	bot_lift         = gi.cvar ("bot_lift", "1", 0);		// the lift capability: plat links, wait/board/ride
 															// controller, 3D column arrival, level-aware homing
@@ -144,7 +148,10 @@ Bot_Shutdown
 void Bot_Shutdown (void)
 {
 	if (bot_logged_map[0])
+	{
+		Goal_ReachSweep ("quit");	// the run-matured graph's reachability truth
 		Nav_Shutdown (bot_logged_map);
+	}
 	Bot_LogEndLevel ();
 }
 
@@ -690,6 +697,7 @@ static void Bot_Navigate (bot_t *b)
 			{
 			vec3_t	tgt, d;
 			int		atnode = (b->path_idx >= b->path_len) ? 1 : 0;
+			int		navq = NAVQ_OK;
 			if (b->goal_item)
 				VectorCopy (b->goal_item->s.origin, tgt);
 			else if (b->goal_node >= 0 && b->goal_node < nav.num_nodes)
@@ -697,10 +705,17 @@ static void Bot_Navigate (bot_t *b)
 			else
 				VectorCopy (ent->s.origin, tgt);
 			VectorSubtract (tgt, ent->s.origin, d);
-			Bot_LogGiveup (b, (float)sqrt(d[0]*d[0] + d[1]*d[1]), d[2],
-				atnode, b->enemy ? 1 : 0);
+			// oracle verdict at giveup time (plans/nav-oracle.md Phase C):
+			// "ok" = a route still existed and execution failed; "no_path" =
+			// the route evaporated (penalization pruned it mid-attempt)
 			if (b->goal_item)
-				Goal_ItemFailed (b->goal_item);
+				navq = Nav_QueryPath (ent->s.origin, b->goal_item->s.origin,
+					NAV_MASK_ALL, NULL, NULL);
+			Bot_LogGiveup (b, (float)sqrt(d[0]*d[0] + d[1]*d[1]), d[2],
+				atnode, b->enemy ? 1 : 0,
+				b->goal_item ? Nav_QueryName (navq) : "");
+			if (b->goal_item)
+				Goal_ItemFailed (b->goal_item, navq);
 			Bot_GoExplore (b);
 			Bot_DecisiveReplan (b, 0.6f);	// failure: brief settle, then move on
 			Bot_Wander (b);
@@ -1035,6 +1050,7 @@ void Bot_RunFrame (void)
 		Nav_Init (level.mapname);
 		Goal_SeedNavNodes ();		// ensure item spots are covered + routable
 		Nav_TagPlatLinks ();		// bot_lift: retag learned lift columns
+		Goal_ReachSweep ("load");	// bot_reachlog: the persisted graph's reachability truth
 		Bot_LogLiftBegin ();		// bot_liftlog: cache plats for diagnosis telemetry
 		Com_sprintf (bot_logged_map, sizeof(bot_logged_map), "%s", level.mapname);
 	}
@@ -1147,6 +1163,60 @@ qboolean Bot_ServerCommand (void)
 	else if (Q_stricmp (cmd, "bot_clear") == 0)
 	{
 		gi.cvar_set ("bot_count", "0");
+		return true;
+	}
+	else if (Q_stricmp (cmd, "nav_query") == 0)
+	{
+		// sv nav_query <item substring> -- interactive oracle: for every item
+		// matching the classname/pickup-name substring, print reachability
+		// from a deathmatch spawn, both with every capability and with the
+		// basic (no water/plat) mask so gated items name their unlock
+		// (plans/nav-oracle.md Phase C)
+		edict_t	*spawn, *it;
+		char	*want = (gi.argc() > 2) ? gi.argv (2) : "";
+		int		i, shown = 0;
+		int		base = NAV_MASK_ALL & ~(NAV_MASK (NAV_LINK_WATER) | NAV_MASK (NAV_LINK_PLAT));
+
+		spawn = G_Find (NULL, FOFS (classname), "info_player_deathmatch");
+		if (!spawn)
+			spawn = G_Find (NULL, FOFS (classname), "info_player_start");
+		if (!spawn)
+		{
+			gi.cprintf (NULL, PRINT_HIGH, "nav_query: no spawn point to query from\n");
+			return true;
+		}
+
+		for (i = (int)game.maxclients + 1; i < globals.num_edicts; i++)
+		{
+			int			code, gate = 0;
+			float		cost = 0;
+			char		gates[40];
+			const char	*nm;
+
+			it = g_edicts + i;
+			if (!it->inuse || !it->item)
+				continue;
+			if (it->spawnflags & DROPPED_ITEM)
+				continue;
+			nm = it->item->pickup_name ? it->item->pickup_name : it->classname;
+			if (want[0] && !strstr (nm, want)
+				&& !(it->classname && strstr (it->classname, want)))
+				continue;
+
+			code = Nav_QueryPath (spawn->s.origin, it->s.origin, base, &cost, &gate);
+			Nav_MaskNames (gate, gates, sizeof(gates));
+			if (code == NAVQ_GATED)
+				gi.cprintf (NULL, PRINT_HIGH, "%s @ (%.0f %.0f %.0f): gated by %s (cost %.0f)\n",
+					nm, it->s.origin[0], it->s.origin[1], it->s.origin[2], gates, cost);
+			else
+				gi.cprintf (NULL, PRINT_HIGH, "%s @ (%.0f %.0f %.0f): %s%s\n",
+					nm, it->s.origin[0], it->s.origin[1], it->s.origin[2],
+					Nav_QueryName (code),
+					(code == NAVQ_OK) ? va(" (cost %.0f)", cost) : "");
+			shown++;
+		}
+		if (!shown)
+			gi.cprintf (NULL, PRINT_HIGH, "nav_query: no item matches '%s'\n", want);
 		return true;
 	}
 

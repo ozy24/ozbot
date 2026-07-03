@@ -41,6 +41,16 @@ NOTE: include "g_local.h" and "bot.h" before this header.
 #define NAV_MASK(t)			(1 << (t))
 #define NAV_MASK_ALL		0xff
 
+// Nav_QueryPath return codes -- the reachability oracle (plans/nav-oracle.md
+// Phase C), the re-release PathReturnCode idea over the learned graph.
+// A learned graph can only prove reachability, never UNreachability:
+// NO_PATH means "no route known (yet)", not "impossible".
+#define NAVQ_OK				0	// routable with the given mask
+#define NAVQ_GATED			1	// routable only with capabilities outside the mask
+#define NAVQ_NO_PATH		2	// no route known even with every capability
+#define NAVQ_NO_GOAL_NODE	3	// graph has no node near the goal position
+#define NAVQ_NO_START_NODE	4	// graph has no node near the start position
+
 // node flags
 #define NAV_FLAG_WATER		1
 
@@ -82,6 +92,13 @@ int  Nav_NearestNode (vec3_t origin);				// nearest node, or -1
 int  Nav_NearestVisibleNode (vec3_t origin, edict_t *ignore);	// nearest with a clear walk, or -1
 int  Nav_FindPath (int start, int goal, int *out, int max);	// A*; returns node count
 int  Nav_FindPathMasked (int start, int goal, int mask, int *out, int max);	// A* over NAV_MASK-allowed link types
+// the oracle: can 'to' be routed to from 'from' under 'mask'?  Returns a
+// NAVQ_* code; on OK/GATED writes the route's g-cost to *cost, on GATED
+// writes the mask of link types that unlock the route to *gate (either
+// out-param may be NULL)
+int  Nav_QueryPath (vec3_t from, vec3_t to, int mask, float *cost, int *gate);
+const char *Nav_QueryName (int code);				// NAVQ_* -> short string for logs
+void Nav_MaskNames (int mask, char *out, int outsize);	// link-type mask -> "water+plat"
 float Nav_LastPathCost (void);						// g-cost of the last successful A*
 void Nav_PenalizeLink (int from, int to);			// learn an untraversable edge
 qboolean Nav_CanWalk (vec3_t from, vec3_t to, edict_t *ignore);	// clear player-sized path?

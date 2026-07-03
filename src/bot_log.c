@@ -242,10 +242,14 @@ Bot_LogGiveup
 
 A giveup with diagnostic context: how far (horizontal/vertical) from the goal,
 whether we'd reached the goal node, and whether we were fighting -- so the
-analyzer can tell *why* item runs fail.
+analyzer can tell *why* item runs fail.  'navq' is the oracle's verdict on
+the goal at giveup time (plans/nav-oracle.md Phase C): "ok" = a route still
+existed and execution failed; "no_path" = the route evaporated (penalization
+pruned it mid-attempt).
 =================
 */
-void Bot_LogGiveup (bot_t *b, float gdist, float gvdist, int atnode, int fighting)
+void Bot_LogGiveup (bot_t *b, float gdist, float gvdist, int atnode, int fighting,
+	const char *navq)
 {
 	edict_t	*ent;
 
@@ -257,11 +261,36 @@ void Bot_LogGiveup (bot_t *b, float gdist, float gvdist, int atnode, int fightin
 		"{\"type\":\"event\",\"event\":\"giveup\",\"t\":%.2f,\"bot\":%d,"
 		"\"x\":%.1f,\"y\":%.1f,\"z\":%.1f,"
 		"\"gdist\":%.0f,\"gvdist\":%.0f,\"atnode\":%d,\"fighting\":%d,"
-		"\"pidx\":%d,\"plen\":%d,\"gbest\":%.0f}\n",
+		"\"pidx\":%d,\"plen\":%d,\"gbest\":%.0f,\"navq\":\"%s\"}\n",
 		level.time, b->id,
 		ent->s.origin[0], ent->s.origin[1], ent->s.origin[2],
 		gdist, gvdist, atnode, fighting,
-		b->path_idx, b->path_len, b->goal_best);
+		b->path_idx, b->path_len, b->goal_best,
+		navq ? navq : "");
+}
+
+/*
+=================
+Bot_LogReach
+
+One record per item from the map-load reachability sweep (bot_reachlog;
+plans/nav-oracle.md Phase C): can the graph route this item from a spawn,
+and which capability unlocks it if not plainly walkable.
+=================
+*/
+void Bot_LogReach (const char *when, const char *item, const char *classname,
+	vec3_t org, const char *code, const char *gate, float cost)
+{
+	if (!log_fp)
+		return;
+
+	fprintf (log_fp,
+		"{\"type\":\"reach\",\"when\":\"%s\",\"item\":\"%s\",\"classname\":\"%s\","
+		"\"x\":%.1f,\"y\":%.1f,\"z\":%.1f,"
+		"\"code\":\"%s\",\"gate\":\"%s\",\"cost\":%.0f}\n",
+		when, item ? item : "", classname ? classname : "",
+		org[0], org[1], org[2],
+		code, gate ? gate : "", cost);
 }
 
 //==========================================================================

@@ -57,6 +57,81 @@ void Goal_SeedNavNodes (void)
 	gi.dprintf ("ozbot: seeded nav nodes for %d items\n", seeded);
 }
 
+/*
+=================
+Goal_ReachSweep
+
+Map-load reachability sweep (bot_reachlog; plans/nav-oracle.md Phase C):
+classify every item spot with the oracle from a deathmatch spawn, against
+the "no special capabilities" mask, so gated items name what unlocks them --
+the diagnosis that took sessions of telemetry mining for the Railgun (water)
+and Grenade Launcher (plat).  Read-only diagnostics: one JSONL record per
+item plus a console summary.  Learned-graph caveat: "ok" proves a route
+exists IN-GRAPH, not that bots can execute it; "no_path" means "not learned
+yet", never "impossible".
+
+Runs twice per level: when="load" (the persisted graph's truth -- measures
+STALENESS: seeded item islands the learner reconnects within seconds of
+play) and when="quit" (the run-matured graph's truth -- the honest
+steady-state readout, since worker-gamedir maturation is discarded).
+=================
+*/
+void Goal_ReachSweep (const char *when)
+{
+	edict_t	*spawn, *it;
+	int		i, total = 0, ok = 0, gated = 0, nopath = 0, nonode = 0;
+	int		base = NAV_MASK_ALL & ~(NAV_MASK (NAV_LINK_WATER) | NAV_MASK (NAV_LINK_PLAT));
+
+	if (bot_reachlog->value == 0)
+		return;
+
+	spawn = G_Find (NULL, FOFS (classname), "info_player_deathmatch");
+	if (!spawn)
+		spawn = G_Find (NULL, FOFS (classname), "info_player_start");
+	if (!spawn)
+		return;
+
+	for (i = (int)game.maxclients + 1; i < globals.num_edicts; i++)
+	{
+		int			code, gate = 0;
+		float		cost = 0;
+		char		gates[40];
+		const char	*nm;
+
+		it = g_edicts + i;
+		if (!it->inuse || !it->item)
+			continue;
+		if (it->spawnflags & DROPPED_ITEM)
+			continue;	// weapons dropped at death spots aren't map item spots
+
+		code = Nav_QueryPath (spawn->s.origin, it->s.origin, base, &cost, &gate);
+		Nav_MaskNames (gate, gates, sizeof(gates));
+		nm = it->item->pickup_name ? it->item->pickup_name : it->classname;
+
+		total++;
+		if (code == NAVQ_OK)
+			ok++;
+		else if (code == NAVQ_GATED)
+		{
+			gated++;
+			gi.dprintf ("ozbot: reach[%s]: %s gated by %s (cost %.0f)\n", when, nm, gates, cost);
+		}
+		else if (code == NAVQ_NO_PATH)
+		{
+			nopath++;
+			gi.dprintf ("ozbot: reach[%s]: %s NO PATH\n", when, nm);
+		}
+		else
+			nonode++;
+
+		Bot_LogReach (when, nm, it->classname, it->s.origin,
+			Nav_QueryName (code), (code == NAVQ_GATED) ? gates : "", cost);
+	}
+
+	gi.dprintf ("ozbot: reach sweep[%s]: %d items: %d ok, %d gated, %d no-path, %d uncovered\n",
+		when, total, ok, gated, nopath, nonode);
+}
+
 void Goal_Blacklist (edict_t *it, float secs)
 {
 	int n;
@@ -78,7 +153,7 @@ goal budget and still couldn't touch the item, so make everyone avoid it for
 an escalating while (20/40/80/160s); any successful collection resets it.
 =================
 */
-void Goal_ItemFailed (edict_t *it)
+void Goal_ItemFailed (edict_t *it, int navq)
 {
 	int n;
 	if (!it || bot_itemfail->value == 0)
@@ -88,6 +163,15 @@ void Goal_ItemFailed (edict_t *it)
 		return;
 	if (item_fails[n] < 4)
 		item_fails[n]++;
+	// bot_itemfail 2: a giveup whose route is GONE from the graph (the oracle
+	// says no_path / no_goal_node at giveup time) jumps straight to the full
+	// escalation -- explore has to relearn the area before another attempt
+	// can succeed, so don't burn three more goal budgets proving that.
+	// (NO_START_NODE is the bot's own position being uncovered, not the
+	// item's fault, so it keeps the normal ladder.)
+	if (bot_itemfail->value >= 2
+		&& (navq == NAVQ_NO_PATH || navq == NAVQ_NO_GOAL_NODE))
+		item_fails[n] = 4;
 	Goal_Blacklist (it, BOT_ITEM_COOLDOWN * (float)(1 << item_fails[n]));
 }
 
