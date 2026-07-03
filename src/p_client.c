@@ -532,7 +532,7 @@ void player_die (edict_t *self, edict_t *inflictor, edict_t *attacker, int damag
 		self->client->ps.pmove.pm_type = PM_DEAD;
 		ClientObituary (self, inflictor, attacker);
 		TossClientWeapon (self);
-		if (deathmatch->value)
+		if (deathmatch->value && !Bot_IsClient (self))
 			Cmd_Help_f (self);		// show scores
 
 		// clear inventory
@@ -1028,7 +1028,7 @@ void spectator_respawn (edict_t *ent)
 			ent->client->pers.spectator = false;
 			gi.WriteByte (svc_stufftext);
 			gi.WriteString ("spectator 0\n");
-			gi.unicast(ent, true);
+			G_UnicastClient(ent, true);
 			return;
 		}
 
@@ -1043,7 +1043,7 @@ void spectator_respawn (edict_t *ent)
 			// reset his spectator var
 			gi.WriteByte (svc_stufftext);
 			gi.WriteString ("spectator 0\n");
-			gi.unicast(ent, true);
+			G_UnicastClient(ent, true);
 			return;
 		}
 	} else {
@@ -1056,7 +1056,7 @@ void spectator_respawn (edict_t *ent)
 			ent->client->pers.spectator = true;
 			gi.WriteByte (svc_stufftext);
 			gi.WriteString ("spectator 1\n");
-			gi.unicast(ent, true);
+			G_UnicastClient(ent, true);
 			return;
 		}
 	}
@@ -1117,6 +1117,7 @@ void PutClientInServer (edict_t *ent)
 
 	index = ent-g_edicts-1;
 	client = ent->client;
+	client->clientNum = index;
 
 	// deathmatch wipes most client data every spawn
 	if (deathmatch->value)
@@ -1718,6 +1719,10 @@ void ClientThink (edict_t *ent, usercmd_t *ucmd)
 			if (client->chase_target) {
 				client->chase_target = NULL;
 				client->ps.pmove.pm_flags &= ~PMF_NO_PREDICTION;
+				client->clientNum = ent - g_edicts - 1;
+				client->ps.gunindex = 0;
+				client->ps.gunframe = 0;
+				VectorClear (client->ps.kick_angles);
 			} else
 				GetChaseTarget(ent);
 
@@ -1738,13 +1743,12 @@ void ClientThink (edict_t *ent, usercmd_t *ucmd)
 			}
 		} else
 			client->ps.pmove.pm_flags &= ~PMF_JUMP_HELD;
-	}
 
-	// update chase cam if being followed
-	for (i = 1; i <= maxclients->value; i++) {
-		other = g_edicts + i;
-		if (other->inuse && other->client->chase_target == ent)
-			UpdateChaseCam(other);
+		if ((client->latched_buttons & BUTTON_USE) && client->chase_target) {
+			client->latched_buttons &= ~BUTTON_USE;
+			client->chase_eyecam = !client->chase_eyecam;
+			gi.centerprintf (ent, "Eyecam %s", client->chase_eyecam ? "on" : "off");
+		}
 	}
 }
 

@@ -18,6 +18,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
 #include "g_local.h"
+#include "bot.h"
 
 
 
@@ -65,7 +66,7 @@ void MoveClientToIntermission (edict_t *ent)
 	if (deathmatch->value || coop->value)
 	{
 		DeathmatchScoreboardMessage (ent, NULL);
-		gi.unicast (ent, true);
+		G_UnicastClient (ent, true);
 	}
 
 }
@@ -262,7 +263,7 @@ Note that it isn't that hard to overflow the 1400 byte message limit!
 void DeathmatchScoreboard (edict_t *ent)
 {
 	DeathmatchScoreboardMessage (ent, ent->enemy);
-	gi.unicast (ent, true);
+	G_UnicastClient (ent, true);
 }
 
 
@@ -332,7 +333,7 @@ void HelpComputer (edict_t *ent)
 
 	gi.WriteByte (svc_layout);
 	gi.WriteString (string);
-	gi.unicast (ent, true);
+	G_UnicastClient (ent, true);
 }
 
 
@@ -537,6 +538,11 @@ void G_CheckChaseStats (edict_t *ent)
 		if (!g_edicts[i].inuse || cl->chase_target != ent)
 			continue;
 		memcpy(cl->ps.stats, ent->client->ps.stats, sizeof(cl->ps.stats));
+		if (cl->chase_eyecam) {
+			cl->ps.gunindex = ent->client->ps.gunindex;
+			cl->ps.gunframe = ent->client->ps.gunframe;
+			VectorCopy (ent->client->ps.kick_angles, cl->ps.kick_angles);
+		}
 		G_SetSpectatorStats(g_edicts + i);
 	}
 }
@@ -552,6 +558,11 @@ void G_SetSpectatorStats (edict_t *ent)
 
 	if (!cl->chase_target)
 		G_SetStats (ent);
+	else if (cl->chase_eyecam && cl->chase_target->inuse) {
+		cl->ps.gunindex = cl->chase_target->client->ps.gunindex;
+		cl->ps.gunframe = cl->chase_target->client->ps.gunframe;
+		VectorCopy (cl->chase_target->client->ps.kick_angles, cl->ps.kick_angles);
+	}
 
 	cl->ps.stats[STAT_SPECTATOR] = 1;
 

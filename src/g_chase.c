@@ -19,6 +19,24 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 #include "g_local.h"
 
+static void Chase_ClearGun (gclient_t *cl)
+{
+	cl->ps.gunindex = 0;
+	cl->ps.gunframe = 0;
+	VectorClear (cl->ps.kick_angles);
+}
+
+static void Chase_SetClientNum (edict_t *ent)
+{
+	gclient_t	*cl = ent->client;
+	int			selfnum = ent - g_edicts - 1;
+
+	if (cl->chase_target && cl->chase_eyecam)
+		cl->clientNum = cl->chase_target - g_edicts - 1;
+	else
+		cl->clientNum = selfnum;
+}
+
 void UpdateChaseCam(edict_t *ent)
 {
 	vec3_t o, ownerv, goal;
@@ -37,11 +55,40 @@ void UpdateChaseCam(edict_t *ent)
 		if (ent->client->chase_target == old) {
 			ent->client->chase_target = NULL;
 			ent->client->ps.pmove.pm_flags &= ~PMF_NO_PREDICTION;
+			Chase_SetClientNum (ent);
+			Chase_ClearGun (ent->client);
 			return;
 		}
 	}
 
 	targ = ent->client->chase_target;
+	Chase_SetClientNum (ent);
+
+	if (ent->client->chase_eyecam) {
+		// First-person: mirror the target's playerstate so the view weapon
+		// renders correctly.  q2pro hides the POV entity when clientNum matches.
+		ent->client->ps = targ->client->ps;
+		ent->client->ps.pmove.pm_flags |= PMF_NO_PREDICTION;
+
+		if (targ->deadflag)
+			ent->client->ps.pmove.pm_type = PM_DEAD;
+		else
+			ent->client->ps.pmove.pm_type = PM_FREEZE;
+
+		VectorCopy (targ->client->v_angle, ent->client->v_angle);
+		VectorCopy (targ->client->v_angle, ent->client->ps.viewangles);
+		VectorScale (ent->client->ps.pmove.origin, 0.125f, ent->s.origin);
+		ent->viewheight = targ->viewheight;
+
+		for (i = 0; i < 3; i++)
+			ent->client->ps.pmove.delta_angles[i] =
+				ANGLE2SHORT(targ->client->v_angle[i] - ent->client->resp.cmd_angles[i]);
+
+		gi.linkentity (ent);
+		return;
+	}
+
+	Chase_ClearGun (ent->client);
 
 	VectorCopy(targ->s.origin, ownerv);
 	VectorCopy(ent->s.origin, oldgoal);
@@ -129,7 +176,7 @@ void ChaseNext(edict_t *ent)
 	} while (e != ent->client->chase_target);
 
 	ent->client->chase_target = e;
-	ent->client->update_chase = true;
+	Chase_SetClientNum (ent);
 }
 
 void ChasePrev(edict_t *ent)
@@ -153,7 +200,7 @@ void ChasePrev(edict_t *ent)
 	} while (e != ent->client->chase_target);
 
 	ent->client->chase_target = e;
-	ent->client->update_chase = true;
+	Chase_SetClientNum (ent);
 }
 
 void GetChaseTarget(edict_t *ent)
@@ -165,11 +212,42 @@ void GetChaseTarget(edict_t *ent)
 		other = g_edicts + i;
 		if (other->inuse && !other->client->resp.spectator) {
 			ent->client->chase_target = other;
-			ent->client->update_chase = true;
-			UpdateChaseCam(ent);
+			ent->client->chase_eyecam = true;
+			Chase_SetClientNum (ent);
 			return;
 		}
 	}
 	gi.centerprintf(ent, "No other players to chase.");
 }
 
+/*
+=================
+ChaseEndServerFrame
+
+Run after all normal ClientEndServerFrames so eyecam mirrors the
+target's finalized playerstate (viewoffset, gun, position).  Running
+ClientEndServerFrame on a chasing spectator would stomp that state.
+=================
+*/
+void ChaseEndServerFrame(edict_t *ent)
+{
+	gclient_t	*cl = ent->client;
+
+	if (!cl->chase_target)
+		return;
+
+	if (!cl->chase_target->inuse || cl->chase_target->client->resp.spectator) {
+		edict_t *old = cl->chase_target;
+		ChaseNext (ent);
+		if (cl->chase_target == old) {
+			cl->chase_target = NULL;
+			cl->ps.pmove.pm_flags &= ~PMF_NO_PREDICTION;
+			Chase_SetClientNum (ent);
+			Chase_ClearGun (cl);
+			return;
+		}
+	}
+
+	UpdateChaseCam (ent);
+	G_SetSpectatorStats (ent);
+}

@@ -262,6 +262,11 @@ typedef struct gitem_s
 
 
 
+// q2pro / R1Q2 extended game features (see q2pro/inc/shared/game.h)
+#define GMF_CLIENTNUM				1
+#define GMF_PROPERINUSE				2
+#define GMF_WANT_ALL_DISCONNECTS	8
+
 //
 // this structure is left intact through an entire game
 // it should be initialized at dll load time, and read/written to
@@ -291,6 +296,8 @@ typedef struct
 	int			num_items;
 
 	qboolean	autosaved;
+
+	int			server_features;	// q2pro sv_features (0 = stock server)
 } game_locals_t;
 
 
@@ -810,6 +817,7 @@ void FetchClientEntData (edict_t *ent);
 // g_chase.c
 //
 void UpdateChaseCam(edict_t *ent);
+void ChaseEndServerFrame(edict_t *ent);
 void ChaseNext(edict_t *ent);
 void ChasePrev(edict_t *ent);
 void GetChaseTarget(edict_t *ent);
@@ -882,6 +890,7 @@ struct gclient_s
 	// known to server
 	player_state_t	ps;				// communicated by server to clients
 	int				ping;
+	int				clientNum;			// POV entity for q2pro eyecam (GMF_CLIENTNUM)
 
 	// private to game
 	client_persistant_t	pers;
@@ -959,6 +968,7 @@ struct gclient_s
 
 	edict_t		*chase_target;		// player we are chasing
 	qboolean	update_chase;		// need to update chase info?
+	qboolean	chase_eyecam;		// chase in first person (else third-person)
 };
 
 

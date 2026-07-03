@@ -207,6 +207,17 @@ void InitGame (void)
 	// items
 	InitItems ();
 
+	// q2pro: advertise clientNum support for proper spectator eyecam
+	{
+		cvar_t	*sv_features;
+
+		gi.cvar ("g_features", "0", CVAR_NOSET);
+		gi.cvar_forceset ("g_features",
+			va ("%d", GMF_CLIENTNUM | GMF_PROPERINUSE | GMF_WANT_ALL_DISCONNECTS));
+		sv_features = gi.cvar ("sv_features", "0", 0);
+		game.server_features = sv_features ? (int)sv_features->value : 0;
+	}
+
 	// ozbot
 	Bot_Init ();
 

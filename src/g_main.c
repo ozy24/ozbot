@@ -188,9 +188,20 @@ void ClientEndServerFrames (void)
 		ent = g_edicts + 1 + i;
 		if (!ent->inuse || !ent->client)
 			continue;
+		if (ent->client->chase_target)
+			continue;
 		ClientEndServerFrame (ent);
 	}
 
+	for (i=0 ; i<maxclients->value ; i++)
+	{
+		ent = g_edicts + 1 + i;
+		if (!ent->inuse || !ent->client)
+			continue;
+		if (!ent->client->chase_target)
+			continue;
+		ChaseEndServerFrame (ent);
+	}
 }
 
 /*
