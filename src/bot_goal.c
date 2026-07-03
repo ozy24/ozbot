@@ -421,12 +421,21 @@ Nearest currently-available item the bot wants (Item_Score > 0), within maxdist,
 ignoring nav coverage and cooldown.  Used for directed exploration so bots walk
 toward items (collecting them by contact and connecting their spots into the
 graph) even before a routed path exists.
+
+bot_decisive: this runs EVERY FRAME between goals, and the raw argmin made a
+bot standing between two near-equal items swing its heading A<->B for the whole
+inter-goal gap (measured: 24% of goal transitions were >=1s standing re-decides,
+median 2.3s) -- and happily pulled toward the very item the bot just gave up on
+(cooldown was ignored).  Decisive mode adds the blacklist check and a sticky
+target: keep the current steer target unless it dies or something meaningfully
+(25%) closer shows up.
 =================
 */
 edict_t *Goal_NearestItem (bot_t *b, float maxdist)
 {
 	edict_t	*it, *best = NULL;
 	float	bestd = maxdist, dist;
+	qboolean decisive = (bot_decisive->value != 0);
 	int		i;
 
 	for (i = (int)game.maxclients + 1; i < globals.num_edicts; i++)
@@ -434,6 +443,8 @@ edict_t *Goal_NearestItem (bot_t *b, float maxdist)
 		it = g_edicts + i;
 		if (!Goal_ItemAvailable (it))
 			continue;
+		if (decisive && Goal_OnCooldown (it))
+			continue;			// never steer at what we just abandoned
 		if (Item_Score (b, it, &dist) <= 0)
 			continue;
 		if (dist < bestd)
@@ -441,6 +452,25 @@ edict_t *Goal_NearestItem (bot_t *b, float maxdist)
 			bestd = dist;
 			best = it;
 		}
+	}
+
+	if (decisive)
+	{
+		// sticky steer target: hold the previous pick unless it's gone stale
+		// (collected, cooled down, unwanted, out of range) or the new winner
+		// is at least 25% closer
+		if (b->steer_item && b->steer_item != best)
+		{
+			float	curd;
+
+			if (Goal_ItemAvailable (b->steer_item)
+				&& !Goal_OnCooldown (b->steer_item)
+				&& Item_Score (b, b->steer_item, &curd) > 0
+				&& curd < maxdist
+				&& !(best && bestd < curd * 0.75f))
+				return b->steer_item;
+		}
+		b->steer_item = best;
 	}
 	return best;
 }

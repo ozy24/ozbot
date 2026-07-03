@@ -29,6 +29,13 @@ Every .c file that includes bot.h must include "g_local.h" first.
 #define LIFT_RIDE		3	// standing on the plat: let it carry us
 #define LIFT_FAILED		4	// timed out this attempt: normal systems resume
 
+// strafe-jump controller states (bot_strafejump).  Chained bunny hops with a
+// forward+side wishdir and a per-tick yaw sweep build speed past the 300 run
+// cap on long clear runways -- calibrated from a human input capture (see
+// plans/wiggly-knitting-token.md / the Phase 19 memory).
+#define SJ_NONE			0
+#define SJ_ACTIVE		1
+
 // per-bot runtime state, kept in a registry indexed by client slot
 // (0-based: registry index i corresponds to edict g_edicts[i+1]).
 typedef struct
@@ -56,6 +63,8 @@ typedef struct
 	int			prev_node;		// last node for link learning
 	int			goal_node;		// destination node (-1 = none)
 	edict_t		*goal_item;		// item entity we're heading for (NULL = roam)
+	edict_t		*steer_item;	// bot_decisive: sticky Goal_NearestItem target
+								// (explore steering hysteresis between goals)
 	qboolean	goal_timing;	// pre-positioning for an item about to respawn
 	int			path[BOT_MAX_PATH];
 	int			path_len;
@@ -84,6 +93,19 @@ typedef struct
 	vec3_t		lift_move_pos;	// BOARD progress: last position...
 	float		lift_move_time;	// ...and when we were there (geometry-block
 								// detector -- boarding should never stall)
+
+	// strafe jumping (bot_strafejump)
+	int			sj_state;		// SJ_*
+	int			sj_side;		// strafe side this hop: +1 = right, -1 = left
+	int			sj_end_idx;		// path index of the qualified runway's last node
+	int			sj_air_ticks;	// ticks since takeoff (0 = grounded)
+	float		sj_cooldown;	// no re-qualify before this level.time
+	float		sj_next_check;	// qualification throttle
+	float		sj_peak;		// telemetry: peak 2D speed this engage
+	int			sj_hops;		// telemetry: hops this engage
+	short		sj_cmd_fwd;		// controller's exact usercmd for this frame
+	short		sj_cmd_side;	//   (Bot_ApplyMovement copies these verbatim --
+	short		sj_cmd_up;		//   the unit-projection path caps diagonals)
 
 	// gaze (bot_gaze / bot_turnrate -- humanization, plans/humanization.md)
 	float		gaze_pitch_wander;	// slow pitch-noise state (OU)
@@ -141,7 +163,10 @@ extern cvar_t	*bot_forwardspeed;
 extern cvar_t	*bot_debug;
 extern cvar_t	*bot_quitafter;
 extern cvar_t	*bot_rollout;
+extern cvar_t	*bot_stucktime;
+extern cvar_t	*bot_wallslide;
 extern cvar_t	*bot_claim;
+extern cvar_t	*bot_decisive;
 extern cvar_t	*bot_pathcost;
 extern cvar_t	*bot_goalbudget;
 extern cvar_t	*bot_budgetcap;
@@ -149,6 +174,7 @@ extern cvar_t	*bot_itemfail;
 extern cvar_t	*bot_swim;
 extern cvar_t	*bot_lift;
 extern cvar_t	*bot_liftlog;
+extern cvar_t	*bot_inputlog;
 
 //
 // bot_move.c -- steering (target point / path following -> usercmd_t)
@@ -183,6 +209,28 @@ qboolean Bot_LiftThink (bot_t *b);
 void Bot_LiftReset (bot_t *b);
 // the func_plat whose horizontal footprint contains pos, or NULL
 edict_t *Bot_FindPlatAt (vec3_t pos);
+
+// strafe jumping (bot_strafejump): chained bunny hops on qualified runways.
+// Returns true while it owns the frame's movement intent (caller skips path
+// following and stuck recovery; the goal budget keeps billing normally --
+// travel is FASTER than budgeted, unlike a lift wait).
+qboolean Bot_StrafeThink (bot_t *b);
+void Bot_StrafeReset (bot_t *b);
+extern cvar_t	*bot_strafejump;
+extern cvar_t	*bot_sjlog;
+
+// strafe-jump qualification funnel (diagnosis only; bot_sjlog >= 2)
+#define SJ_DIAG_QUALIFY		0	// SJ_QualifyRunway calls
+#define SJ_DIAG_LINK		1	// stopped by a non-WALK link
+#define SJ_DIAG_DZ			2	// stopped by a vertical step
+#define SJ_DIAG_TURN		3	// stopped by a sharp bend
+#define SJ_DIAG_TRACE		4	// stopped by clearance traces
+#define SJ_DIAG_SHORT		5	// stretch ended below SJ_MIN_RUNWAY
+#define SJ_DIAG_PRESIM		6	// first-hop pre-sim rejected
+#define SJ_DIAG_ENGAGE		7	// engaged
+#define SJ_DIAG_MAX			8
+extern int sj_diag[SJ_DIAG_MAX];
+void Bot_LogSJDiag (void);		// bot_log.c: periodic funnel dump
 
 //
 // bot_gaze.c -- humanization: out-of-combat gaze + view-turn dynamics
@@ -250,10 +298,13 @@ void Bot_LogBeginLevel (const char *mapname);	// open a fresh JSONL for this map
 void Bot_LogEndLevel (void);					// flush + close the current JSONL
 void Bot_LogTick (bot_t *b);					// per-tick state record
 void Bot_LogEvent (bot_t *b, const char *event);	// spawn/death/etc.
+void Bot_LogInput (edict_t *ent, usercmd_t *ucmd);	// bot_inputlog: human usercmd trace
 void Bot_LogMaybeFlush (void);					// periodic flush
 // bot_liftlog diagnosis instrumentation (throwaway, see plans/lift-riding.md)
 void Bot_LogLiftBegin (void);					// cache func_plats + emit platinfo
 void Bot_LogLiftTick (bot_t *b);				// per-tick record while near a plat
 void Bot_LogPenalize (bot_t *b, int from, int to);	// link penalization event
+// bot_sjlog: strafe-jump controller events (engage / hop / done / abort_*)
+void Bot_LogSJ (bot_t *b, const char *phase, int hops, float peak);
 
 #endif // OZBOT_BOT_H

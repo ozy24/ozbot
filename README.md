@@ -77,6 +77,8 @@ ITEM completion on q2dm1, same measurement rig throughout:
 | Vertical swimming (`bot_swim`) | **~37%** | first locomotion-layer win: 3D steering in water (swim upmove + 3D waypoint arrival + water-jump exits) unlocked q2dm1's swim-gated Railgun — 0% → 48% completion, pickups +14% and frags +30% in 5/5 seeds, deaths flat, bit-identical on waterless maps |
 | Lift riding (`bot_lift`) | **~42%** | second locomotion win: `func_plat` links + a wait/board/ride controller that makes deliberate stillness legal (stuck detection, replanning, and the goal budget are suspended while a plat hop is in play) unlocked q2dm1's lift-gated items — Grenade Launcher 5% → **41%**, Chaingun 0% → **55%**, pickups +13% and frags +15% over 5 seeds; q2dm5 +34% pickups, q2dm8 +11%, q2dm3 a wash over 8 seeds |
 | Humanization stack (6 cvars, Phase 18) | ~44–45% (**style goal**) | bots *look/move like humans*: measured against 1,299 pro demos, the mean distribution distance across 8 observable features fell **38%** (pitch, gaze, turn dynamics, jump rate, idle texture) for **−4.6% frags / +2.0pt ITEM** over 10 seeds — plus a deliberate ~11% kill deficit vs 360°-vision bots in mixed matches (`bot_fov` ends wallhack vision) |
+| Strafe jumping (`bot_strafejump`, Phase 19) | **~46%** (pickups +6%) | third locomotion win, calibrated from a human input capture: chained bunny hops (forward+side held, per-tick optimal yaw sweep, jump held across landings) on trace-qualified straight/gently-curving runways reach **440–520 ups** vs the 300 run cap — ~1 engage per 7 bot-seconds, 83% clean completions, giveups −11%, frags/hazard deaths flat over 8 seeds. The 10Hz command rate is no barrier (air-accel is tick-rate neutral); the one physics gap vs real clients (q2pro's strafejump-hack landing lockout) is closed DLL-side, so it works on any stock engine |
+| Decisiveness (`bot_decisive`, Phase 20) | **~50%** (**pickups +45%**) | biggest pickup-rate win since route-cost scoring, found from the user *watching* the bots: 24% of goal transitions were 2–3s **standing re-decides** — the bot parked between goals (the 1–3s post-goal wander pause) while hysteresis-free nearest-item steering swung its view A↔B, sometimes toward the very item it had just abandoned. Fix: re-pick ~0.2s after success / ~0.6s after failure (the existing 10s blacklist already prevents re-choosing the failed item), sticky + blacklist-aware explore steering, and uncommitted picks no longer phantom-claim items against other bots. Standing re-decides −90% (26–28% → 1–3% of transitions), goal throughput +27%, ITEM +6pts, frags flat, giveup/item_lost *rates* down — 5/5 seeds |
 
 Other validated improvements along the way: goal-node reach rate 38% → 59% (Phase 1 tuning);
 combat unfroze — %time-in-combat dropped from a pathological 87–99% (bots stuck staring at each
@@ -119,7 +121,7 @@ knowledge, not failures to hide:
 
 | Experiment | Result | Lesson |
 |---|---|---|
-| Import navigation from ~1300 pro demos | bot got **worse** | pro routes assume pro movement (strafe-jumps, momentum) the bot can't execute |
+| Import navigation from ~1300 pro demos | bot got **worse** | pro routes assume pro movement (strafe-jumps, momentum) the bot couldn't execute (Phase 19 later added runway strafe-jumping, but the finding stands: imported *routes* still assume trick jumps the follower can't reproduce) |
 | Calibrate weapon priority from pro demo kill-efficiency | dead tie (171 vs 170 frags) | pro data bakes in pro *execution* skill; it doesn't transfer to a bot without that ceiling |
 | More nav-graph maturation (more bot-hours) | ITEM% regressed 23% → 15% | past coverage, extra nodes add routing noise, not capability |
 | Progress watchdog (abandon stalled goals early) | ITEM% crashed to 14% | faster recycling floods attempts when re-picks are equally unreachable |
@@ -179,7 +181,10 @@ at real time and `--seconds` is wall-clock.
 | `bot_swim` | 1 | 3D steering in water: vertical swim intent + water-jump ledge exits |
 | `bot_lift` | 1 | lift riding: learned plat columns become `PLAT` links; a wait/board/ride controller waits clear of the shaft, boards at bottom, rides to the top (suspending stuck/replan/budget while it does), and homing at items only engages on the item's own level |
 | `bot_liftlog` | 0 | diagnostic: per-tick telemetry for bots near `func_plat`s + plat state records |
+| `bot_strafejump` | 1 | strafe jumping: on a trace-qualified runway (straight or gently curving stretch of the committed path, clear at body height, safe floor on open sides) chain bunny hops — forward+side saturated, per-tick optimal yaw sweep, jump held across landings — committing only after a `gi.Pmove` pre-sim of the first hop lands clean; clears the landing jump-lockout for parity with real q2pro clients |
+| `bot_sjlog` | 0 | diagnostic: strafe-jump engage/hop/done/abort events (2 = plus qualification-funnel counters) |
 | `bot_claim` | 1 | skip items another bot is already going for |
+| `bot_decisive` | 1 | decisiveness: re-pick the next goal ~0.2s after a pickup (0.6s after a failure) instead of wandering 1–3s; sticky, blacklist-aware between-goal steering (no more standing view-swings between two candidate items); uncommitted goal evaluations don't claim items |
 | `bot_rollout` | 1 | physics-forward rollout recovery when stuck |
 | `bot_lead` | 1 | lead moving targets by projectile flight time (skill-scaled) |
 | `bot_flee` | 1 | retreat (while firing) when clearly outmatched |

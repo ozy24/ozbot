@@ -26,7 +26,10 @@ cvar_t	*bot_debug;
 cvar_t	*bot_seed;
 cvar_t	*bot_quitafter;
 cvar_t	*bot_rollout;
+cvar_t	*bot_stucktime;
+cvar_t	*bot_wallslide;
 cvar_t	*bot_claim;
+cvar_t	*bot_decisive;
 cvar_t	*bot_pathcost;
 cvar_t	*bot_goalbudget;
 cvar_t	*bot_budgetcap;
@@ -34,6 +37,9 @@ cvar_t	*bot_itemfail;
 cvar_t	*bot_swim;
 cvar_t	*bot_lift;
 cvar_t	*bot_liftlog;
+cvar_t	*bot_strafejump;
+cvar_t	*bot_sjlog;
+cvar_t	*bot_inputlog;
 
 // registry indexed by client slot (index i <-> g_edicts[i+1])
 static bot_t	bots[MAX_CLIENTS];
@@ -70,7 +76,12 @@ void Bot_Init (void)
 	bot_seed         = gi.cvar ("bot_seed", "0", 0);
 	bot_quitafter    = gi.cvar ("bot_quitafter", "0", 0);	// >0: quit after N game seconds (times fastsim runs)
 	bot_rollout      = gi.cvar ("bot_rollout", "1", 0);
+	bot_stucktime    = gi.cvar ("bot_stucktime", "1.0", 0);	// seconds of <24u travel before stuck-recovery fires
+	bot_wallslide    = gi.cvar ("bot_wallslide", "0", 0);	// deflect move intent along walls instead of pinning
 	bot_claim        = gi.cvar ("bot_claim", "1", 0);
+	bot_decisive     = gi.cvar ("bot_decisive", "1", 0);	// prompt goal re-picks + sticky explore steering
+															// (kills the standing A<->B re-decide loop; Phase 20:
+															// pickups +45%, ITEM +6pts, 5/5 seeds)
 	bot_pathcost     = gi.cvar ("bot_pathcost", "1", 0);	// score items by A* route cost, not straight-line distance
 	bot_goalbudget   = gi.cvar ("bot_goalbudget", "1", 0);	// goal timeout scaled to route cost, not flat 12s
 	bot_budgetcap    = gi.cvar ("bot_budgetcap", "15", 0);	// max seconds to fund any one goal route
@@ -79,6 +90,10 @@ void Bot_Init (void)
 	bot_lift         = gi.cvar ("bot_lift", "1", 0);		// the lift capability: plat links, wait/board/ride
 															// controller, 3D column arrival, level-aware homing
 	bot_liftlog      = gi.cvar ("bot_liftlog", "0", 0);		// diagnosis telemetry near func_plats (plans/lift-riding.md)
+	bot_strafejump   = gi.cvar ("bot_strafejump", "1", 0);	// chained strafe-jump travel on clear runways (Phase 19:
+															// +6% pickups, giveups -11%, frags flat, 8-seed A/B)
+	bot_sjlog        = gi.cvar ("bot_sjlog", "0", 0);		// strafe-jump controller event telemetry
+	bot_inputlog     = gi.cvar ("bot_inputlog", "0", 0);	// 1 = log real players' per-frame usercmd (jump analysis; see ozbot-input-logger memory)
 	bot_gaze         = gi.cvar ("bot_gaze", "1", 0);		// humanization: path look-ahead, glances, live pitch
 	bot_turnrate     = gi.cvar ("bot_turnrate", "1", 0);	// humanization: slew-limited view turns
 	bot_humantest    = gi.cvar ("bot_humantest", "0", 0);	// head-to-head: even ids humanized, odd stock
@@ -179,6 +194,7 @@ static void Bot_ResetNavState (bot_t *b)
 	b->prev_node = -1;
 	b->goal_node = -1;
 	b->goal_item = NULL;
+	b->steer_item = NULL;
 	b->goal_timing = false;
 	b->goal_cost = 0;
 	b->flee      = false;
@@ -187,6 +203,7 @@ static void Bot_ResetNavState (bot_t *b)
 	b->replan_time  = level.time + 1.0;
 	b->progress_time = level.time;
 	Bot_LiftReset (b);
+	Bot_StrafeReset (b);
 	b->glance_until = 0;			// no stale glance across a respawn
 	// deterministic (NO random() here): this runs with humanization off too,
 	// and an extra rand() per respawn would shift the whole stream vs stock,
@@ -457,7 +474,28 @@ static void Bot_GoExplore (bot_t *b)
 	b->path_idx  = 0;
 	b->replan_time   = level.time + 1.0 + random() * 2.0;
 	b->progress_time = level.time;
+	b->steer_item    = NULL;	// fresh explore leg: no stale steering target
 	Bot_LiftReset (b);
+	Bot_StrafeReset (b);
+}
+
+/*
+=================
+Bot_DecisiveReplan
+
+bot_decisive: don't stand around after a goal ends -- re-pick promptly.  The
+10s item blacklist applied by Bot_GoExplore is what actually prevents
+re-choosing the abandoned item; the 1-3s wander pause GoExplore schedules on
+top of it read as indecision (measured: 24% of goal transitions were >=1s
+standing re-decides, median 2.3s, with the view swinging between candidates).
+Called AFTER Bot_GoExplore so the off-arm RNG stream is untouched -- the
+random() in GoExplore still runs, its result is just overwritten.
+=================
+*/
+static void Bot_DecisiveReplan (bot_t *b, float delay)
+{
+	if (bot_decisive->value != 0)
+		b->replan_time = level.time + delay;
 }
 
 /*
@@ -505,7 +543,12 @@ static qboolean Bot_UpdateStuck (bot_t *b)
 		b->progress_time = level.time;
 		VectorCopy (b->ent->s.origin, b->last_pos);
 	}
-	return (level.time - b->progress_time) > 1.0;
+	{
+		float thresh = bot_stucktime->value;
+		if (thresh <= 0)
+			thresh = 1.0f;		// guard: 0 would fire every frame
+		return (level.time - b->progress_time) > thresh;
+	}
 }
 
 /*
@@ -597,6 +640,7 @@ static void Bot_Navigate (bot_t *b)
 				Bot_LogItemEvent (b, (dd < 96) ? "pickup" : "item_lost", nm);
 				Goal_ItemSucceeded (b->goal_item);	// either way, someone collected it
 				Bot_GoExplore (b);
+				Bot_DecisiveReplan (b, 0.2f);	// success: next objective, now
 				Bot_Wander (b);
 				return;
 			}
@@ -628,6 +672,7 @@ static void Bot_Navigate (bot_t *b)
 			if (b->goal_item)
 				Goal_ItemFailed (b->goal_item);
 			Bot_GoExplore (b);
+			Bot_DecisiveReplan (b, 0.6f);	// failure: brief settle, then move on
 			Bot_Wander (b);
 			return;
 			}
@@ -642,6 +687,7 @@ static void Bot_Navigate (bot_t *b)
 			{
 				Bot_LogEvent (b, "pathfail");
 				Bot_GoExplore (b);
+				Bot_DecisiveReplan (b, 0.6f);
 				Bot_Wander (b);
 				return;
 			}
@@ -657,11 +703,20 @@ static void Bot_Navigate (bot_t *b)
 			{
 				b->progress_time = level.time;
 				b->goal_time += FRAMETIME;
+				if (b->sj_state != SJ_NONE)
+					Bot_StrafeReset (b);	// the lift owns the frame now
 				return;
 			}
 		}
 		else if (b->lift_state != LIFT_NONE)
 			Bot_LiftReset (b);	// cvar turned off mid-attempt: clear stale state
+
+		// strafe jumping: on a qualified runway the controller owns movement
+		// AND facing.  Unlike the lift, the goal budget keeps billing (we are
+		// travelling faster than budgeted) and stuck detection stays live
+		// (40-55u/tick never trips it; the controller's own aborts fire first).
+		if (Bot_StrafeThink (b))
+			return;
 
 		if (!Bot_FollowPath (b))
 		{
@@ -679,6 +734,7 @@ static void Bot_Navigate (bot_t *b)
 			// roam node reached
 			Bot_LogEvent (b, "reach");
 			Bot_GoExplore (b);
+			Bot_DecisiveReplan (b, 0.2f);	// arrival: next objective, now
 			Bot_Wander (b);
 			return;
 		}
@@ -707,6 +763,7 @@ static void Bot_Navigate (bot_t *b)
 				{
 					Bot_LogEvent (b, "pathfail");
 					Bot_GoExplore (b);
+					Bot_DecisiveReplan (b, 0.6f);
 					Bot_Wander (b);
 				}
 			}
@@ -775,6 +832,7 @@ static void Bot_Navigate (bot_t *b)
 				b->goal_cost     = Nav_LastPathCost ();
 				b->goal_best     = 99999;
 				Bot_LiftReset (b);
+				Bot_StrafeReset (b);	// fresh path: any runway is stale
 				if (b->goal_item)
 					Bot_LogItemEvent (b, "goal_item", b->goal_item->item->pickup_name);
 				else
@@ -782,7 +840,16 @@ static void Bot_Navigate (bot_t *b)
 			}
 		}
 		if (b->mode != BOT_MODE_GOAL)
+		{
 			b->replan_time = level.time + 1.0;
+			// bot_decisive: Goal_Select may have set goal_item on an
+			// evaluation whose commit was rejected -- while we sit in
+			// EXPLORE that phantom pick still "claims" the item against
+			// other bots (Bot_ItemClaimed), enabling anti-correlated
+			// pair swapping.  An uncommitted pick claims nothing.
+			if (bot_decisive->value != 0)
+				b->goal_item = NULL;
+		}
 	}
 }
 
@@ -819,7 +886,18 @@ static void Bot_Think (bot_t *b, usercmd_t *cmd)
 	//    not engaged the gaze layer picks the facing (stock behavior -- face
 	//    the travel direction, pitch 0 -- when its cvars are off)
 	if (!Combat_Aim (b, cmd, &facing_yaw, &facing_pitch))
-		Bot_GazeThink (b, &facing_yaw, &facing_pitch);
+	{
+		// strafe jumping: the controller's yaw IS the maneuver (the wishdir
+		// angle the speed gain depends on) -- the gaze slew/glances would
+		// corrupt it.  The sweep it produces is the human-looking motion.
+		if (bot_strafejump->value != 0 && b->sj_state == SJ_ACTIVE)
+		{
+			facing_yaw = b->move_yaw;
+			facing_pitch = 0;
+		}
+		else
+			Bot_GazeThink (b, &facing_yaw, &facing_pitch);
+	}
 
 	cmd->angles[YAW]   = (short)(ANGLE2SHORT(facing_yaw)   - ent->client->ps.pmove.delta_angles[YAW]);
 	cmd->angles[PITCH] = (short)(ANGLE2SHORT(facing_pitch) - ent->client->ps.pmove.delta_angles[PITCH]);
@@ -983,11 +1061,29 @@ void Bot_RunFrame (void)
 		Bot_Think (b, &cmd);
 		ClientThink (ent, &cmd);
 
+		// strafe jumping (bot_strafejump): physics parity with real clients.
+		// q2pro gives networked clients the "strafejump hack" (no PMF_TIME_LAND
+		// jump lockout on landing; sv_strafejump_hack, default 1) but bots run
+		// Pmove with the engine's default params, so every hop landing would
+		// force a 100ms ground-friction frame (~60% speed loss) and kill the
+		// chain.  The game owns ps.pmove between frames: clearing the flag here
+		// reproduces strafehack semantics exactly (it is only read at the START
+		// of the next Pmove), works on any stock engine, and is gated to bots
+		// actively mid-chain so everything else stays byte-identical.
+		if (bot_strafejump->value != 0 && b->sj_state == SJ_ACTIVE
+			&& (ent->client->ps.pmove.pm_flags & PMF_TIME_LAND)
+			&& !(ent->client->ps.pmove.pm_flags & (PMF_TIME_TELEPORT | PMF_TIME_WATERJUMP)))
+		{
+			ent->client->ps.pmove.pm_flags &= ~PMF_TIME_LAND;
+			ent->client->ps.pmove.pm_time = 0;
+		}
+
 		Bot_LogTick (b);
 		Bot_LogLiftTick (b);
 	}
 
 	Bot_DebugDraw ();
+	Bot_LogSJDiag ();
 	Nav_MaybeSave (bot_logged_map);
 	Bot_LogMaybeFlush ();
 }

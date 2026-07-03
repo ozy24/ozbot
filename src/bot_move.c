@@ -662,6 +662,618 @@ qboolean Bot_LiftThink (bot_t *b)
 	return true;
 }
 
+//==========================================================================
+// strafe jumping (bot_strafejump) -- Phase 19
+//
+// Chained bunny hops with forward+side both held and a per-tick yaw sweep
+// build speed past the 300 run cap (calibrated from a human input capture:
+// 300 -> 557 over 5 hops).  The physics is tick-rate neutral -- air accel
+// grants accel*frametime*wishspeed = 30 ups per 100ms tick, the same
+// per-second budget a 30Hz human gets -- and a re-jump on the first grounded
+// tick skips ground friction entirely (PM_CheckJump nulls groundentity
+// before PM_Friction runs).  Holding jump across the landing is safe:
+// PMF_JUMP_HELD cannot latch while airborne, so no landing-time prediction
+// is needed at 100ms quantization.
+//
+// The one physics gap vs a real client: bot-initiated Pmove runs with the
+// engine's DEFAULT pmove params, which lack the "strafehack" q2pro grants
+// real clients (sv_strafejump_hack, default 1).  Without it every hop
+// landing (vz ~ -290) sets PMF_TIME_LAND, a 144ms jump lockout that forces
+// a full 100ms ground-friction frame.  The game owns ps.pmove between
+// frames, so Bot_RunFrame clears that flag for a bot mid-chain -- exactly
+// reproducing the physics humans already play under, on any stock engine.
+//
+// The controller only engages on a QUALIFIED RUNWAY: a stretch of the
+// committed A* path made of near-collinear flat WALK links, hull-trace
+// verified for width, headroom, and floor at hop height.  While active it
+// owns movement intent and facing (the gaze slew would corrupt the wishdir
+// angle), writes the usercmd directly (the unit-projection path caps
+// diagonals), and hands back cleanly at the runway's end with the momentum
+// kept.
+//==========================================================================
+
+#define SJ_MIN_RUNWAY		256.0f	// min qualified spine length to engage
+#define SJ_SEG_MAX_TURN		35.0f	// per-segment heading change (gentle curves ok)
+#define SJ_SEG_MAX_DZ		24.0f	// near-flat (hop rhythm breaks on real stairs)
+#define SJ_ENGAGE_SPEED		230.0f	// ground speed needed to start hopping
+#define SJ_ABORT_SPEED		200.0f	// grounded below this mid-chain = blocked
+#define SJ_COOLDOWN			1.5f	// after an abort / failed qualify
+#define SJ_CHECK_INTERVAL	0.3f	// qualification throttle
+#define SJ_LANE_OFFSET		30.0f	// lateral clearance lanes (hull covers +/-46)
+#define SJ_HEAD_ERR_MAX		55.0f	// velocity heading vs spine target = drifted off
+#define SJ_LOOKAHEAD		340.0f	// spine target distance (smooths node zig-zag)
+#define SJ_WISH_CAP			270.0f	// theta* = acos(cap/speed) keeps the full
+									// 30 ups accel quantum granted every tick
+
+// qualification funnel counters (bot_sjlog >= 2 dumps them periodically):
+// where runway candidates die, so thresholds can be tuned against reality
+int sj_diag[SJ_DIAG_MAX];
+
+static float SJ_AngleNorm (float a)
+{
+	while (a > 180.0f)
+		a -= 360.0f;
+	while (a < -180.0f)
+		a += 360.0f;
+	return a;
+}
+
+/*
+=================
+SJ_FacingYaw
+
+The per-tick yaw law.  Air accel adds speed only while the projection of
+velocity onto wishdir is below the 300 cap, so as speed grows the wishdir
+must sit further off the velocity: theta* = acos(SJ_WISH_CAP/speed).  With
+forward+side both held the wishdir is 45 deg off the facing toward the strafe
+side, so facing = vel_heading + side*(45 - theta*).  Below the cap this
+degenerates to pushing straight along the velocity (max accel), and as speed
+rises it reproduces the accelerating yaw sweep seen in the human capture.
+side: +1 = sidemove +400 (strafing right pulls the velocity clockwise).
+=================
+*/
+static float SJ_FacingYaw (vec3_t velocity, int side, float fallback_heading)
+{
+	vec3_t	v;
+	float	speed, theta;
+
+	VectorCopy (velocity, v);
+	v[2] = 0;
+	speed = VectorLength (v);
+	if (speed < 60)
+		return fallback_heading;
+
+	if (speed <= SJ_WISH_CAP)
+		theta = 0;
+	else
+		theta = (float)acos ((double)(SJ_WISH_CAP / speed)) * 57.295780f;
+
+	return vectoyaw (v) + (float)side * (45.0f - theta);
+}
+
+/*
+=================
+SJ_SegmentClear
+
+Traces one runway chord against the WORLD only (MASK_SOLID: other
+players/bots on the runway are transient -- the live abort logic handles
+them; qualifying against them starved engagement to ~nothing).  What
+actually kills a chain is a wall ahead, a floor gap, or a hazard pool --
+NOT low ceilings: an apex head-clip merely flattens the hop (Pmove clips
+vertical velocity only) and the held-jump landing re-fires, so we
+deliberately do NOT demand apex headroom (a hull lane at +46 rejected every
+doorframe arch on the map and starved engagement).  Node origins sit 24
+above the floor; lanes run at +26 so the 18u auto-steps a runner clears
+don't read as walls, while real walls (floor to ceiling) still do.
+=================
+*/
+static qboolean SJ_SegmentClear (edict_t *ent, vec3_t from, vec3_t to)
+{
+	vec3_t	dir, right, s, e, up = {0, 0, 1};
+	trace_t	tr;
+	int		i;
+
+	VectorSubtract (to, from, dir);
+	dir[2] = 0;
+	if (VectorNormalize (dir) < 1)
+		return true;			// co-located: nothing to check
+
+	// center lane: the bot's hull at body height (walls, blockers)
+	VectorCopy (from, s);
+	s[2] += 26;
+	VectorCopy (to, e);
+	e[2] += 26;
+	tr = gi.trace (s, ent->mins, ent->maxs, e, ent, MASK_SOLID);
+	if (tr.fraction < 1.0f || tr.startsolid || tr.allsolid)
+		return false;
+
+	// side lanes: point probes at +/-SJ_LANE_OFFSET.  A wall on ONE side is
+	// fine (humans strafe jump along walls; a graze only sheds a little
+	// speed), but we need at least one open side to weave in -- and any
+	// side that IS open must have real, non-hazard floor at its far end,
+	// so a drifting hop can't carry the bot over a drop or into lava.
+	CrossProduct (dir, up, right);
+	{
+		int	sides_clear = 0;
+
+		for (i = -1; i <= 1; i += 2)
+		{
+			vec3_t	dn, lp;
+
+			VectorMA (from, SJ_LANE_OFFSET * i, right, s);
+			s[2] = from[2] + 26;
+			VectorMA (to, SJ_LANE_OFFSET * i, right, e);
+			e[2] = to[2] + 26;
+			tr = gi.trace (s, vec3_origin, vec3_origin, e, ent, MASK_SOLID);
+			if (tr.fraction < 1.0f || tr.startsolid)
+				continue;		// walled: can't drift there, floor irrelevant
+
+			VectorCopy (e, dn);
+			dn[2] -= 96;
+			tr = gi.trace (e, vec3_origin, vec3_origin, dn, ent, MASK_SOLID);
+			if (tr.fraction == 1.0f)
+				return false;	// open side over a drop: too dangerous
+			VectorCopy (tr.endpos, lp);
+			lp[2] += 8;
+			if (gi.pointcontents (lp) & (CONTENTS_LAVA | CONTENTS_SLIME))
+				return false;
+			sides_clear++;
+		}
+		if (sides_clear == 0)
+			return false;		// a slot exactly our width: no room to weave
+	}
+	return true;
+}
+
+/*
+=================
+SJ_QualifyRunway
+
+Find the furthest path node reachable along a straight clear CHORD from the
+bot: the spine of a runway is the corridor's shape, not the learned nodes'
+zig-zag polyline (per-segment collinearity starved chains to one hop -- the
+nodes wander ~30 deg down perfectly straight halls).  A node qualifies as
+the runway end if every intermediate path node hugs the chord laterally,
+all of it is near our floor height, and the chord traces clear.  Returns
+the path index of the runway's last node, or -1 if the best chord is
+shorter than SJ_MIN_RUNWAY.
+=================
+*/
+static int SJ_QualifyRunway (bot_t *b)
+{
+	edict_t	*ent = b->ent;
+	vec3_t	chord, right, d, up = {0, 0, 1};
+	float	total = 0;
+	int		k, j, last = -1;
+
+	if (b->path_len <= 0 || b->path_idx >= b->path_len)
+		return -1;
+
+	sj_diag[SJ_DIAG_QUALIFY]++;
+	for (k = b->path_idx; k < b->path_len; k++)
+	{
+		float	len;
+		int		node = b->path[k];
+
+		if (node < 0 || node >= nav.num_nodes)
+			break;
+		if (k > b->path_idx && Bot_LinkType (b->path[k - 1], node) != NAV_LINK_WALK)
+		{
+			sj_diag[SJ_DIAG_LINK]++;
+			break;
+		}
+		if (fabs (nav.nodes[node].origin[2] - ent->s.origin[2]) > SJ_SEG_MAX_DZ)
+		{
+			sj_diag[SJ_DIAG_DZ]++;
+			break;
+		}
+
+		VectorSubtract (nav.nodes[node].origin, ent->s.origin, chord);
+		chord[2] = 0;
+		len = VectorLength (chord);
+		if (len < 64)
+		{
+			last = k;			// too close to define a chord: absorb it
+			if (len > total)
+				total = len;
+			continue;
+		}
+		VectorScale (chord, 1.0f / len, chord);
+		CrossProduct (chord, up, right);
+
+		// every intermediate node must hug this chord
+		for (j = b->path_idx; j < k; j++)
+		{
+			VectorSubtract (nav.nodes[b->path[j]].origin, ent->s.origin, d);
+			if (fabs (DotProduct (d, right)) > 40)
+				break;
+		}
+		if (j < k)
+		{
+			sj_diag[SJ_DIAG_TURN]++;
+			break;
+		}
+
+		if (!SJ_SegmentClear (ent, ent->s.origin, nav.nodes[node].origin))
+		{
+			sj_diag[SJ_DIAG_TRACE]++;
+			break;
+		}
+
+		last = k;
+		total = len;
+	}
+
+	if (last < 0 || total < SJ_MIN_RUNWAY)
+	{
+		sj_diag[SJ_DIAG_SHORT]++;
+		return -1;
+	}
+	return last;
+}
+
+/*
+=================
+SJ_SimFirstHop
+
+Commit gate: forward-simulate the whole first hop (takeoff to landing)
+through the real movement code with the exact per-tick cmds the live
+controller would issue, and only engage if it lands grounded, dry, near the
+intended line, with real forward progress.  Deterministic physics makes this
+an exact prediction, so the controller never flails (same principle as
+Bot_RolloutRecover / the Phase 17 lift pre-sim).
+=================
+*/
+static qboolean SJ_SimFirstHop (bot_t *b, float heading, int side)
+{
+	edict_t	*ent = b->ent;
+	pmove_t	pm;
+	vec3_t	start, land, delta, ang = {0, 0, 0}, fwd, right, upv;
+	float	fwd_prog, lateral;
+	int		i, t;
+	qboolean landed = false;
+
+	memset (&pm, 0, sizeof(pm));
+	pm.s.pm_type = PM_NORMAL;
+	pm.s.gravity = (short)sv_gravity->value;
+	for (i = 0; i < 3; i++)
+	{
+		pm.s.origin[i]   = (short)(ent->s.origin[i] * 8);
+		pm.s.velocity[i] = (short)(ent->velocity[i] * 8);
+	}
+	pm.trace = PM_trace;
+	pm.pointcontents = gi.pointcontents;
+	pm_passent = ent;
+	VectorCopy (ent->s.origin, start);
+
+	for (t = 0; t < 9; t++)
+	{
+		vec3_t	vel;
+		float	yaw;
+
+		// mirror the live controller's landing-lockout parity clear
+		if ((pm.s.pm_flags & PMF_TIME_LAND)
+			&& !(pm.s.pm_flags & (PMF_TIME_TELEPORT | PMF_TIME_WATERJUMP)))
+		{
+			pm.s.pm_flags &= ~PMF_TIME_LAND;
+			pm.s.pm_time = 0;
+		}
+
+		for (i = 0; i < 3; i++)
+			vel[i] = pm.s.velocity[i] * 0.125f;
+		yaw = SJ_FacingYaw (vel, side, heading);
+
+		memset (&pm.cmd, 0, sizeof(pm.cmd));
+		pm.cmd.msec        = 100;
+		pm.cmd.forwardmove = 400;
+		pm.cmd.sidemove    = (short)(400 * side);
+		pm.cmd.upmove      = (t == 1) ? 0 : 350;	// one release clears JUMP_HELD
+		pm.cmd.angles[YAW]   = (short)(ANGLE2SHORT(yaw) - pm.s.delta_angles[YAW]);
+		pm.cmd.angles[PITCH] = (short)(0 - pm.s.delta_angles[PITCH]);
+		pm.snapinitial = (t == 0);
+		gi.Pmove (&pm);
+
+		if (t >= 2 && pm.groundentity)
+		{
+			landed = true;
+			break;
+		}
+	}
+
+	if (!landed || pm.waterlevel > 0)
+		return false;
+
+	for (i = 0; i < 3; i++)
+		land[i] = pm.s.origin[i] * 0.125f;
+	VectorSubtract (land, start, delta);
+	if (fabs (delta[2]) > 40)
+		return false;			// fell off / climbed something: not our runway
+	delta[2] = 0;
+
+	ang[YAW] = heading;
+	AngleVectors (ang, fwd, right, upv);
+	fwd_prog = DotProduct (delta, fwd);
+	lateral  = (float)fabs (DotProduct (delta, right));
+	return (fwd_prog > 100 && lateral < 48);
+}
+
+/*
+=================
+Bot_StrafeReset
+=================
+*/
+void Bot_StrafeReset (bot_t *b)
+{
+	b->sj_state = SJ_NONE;
+	b->sj_end_idx = -1;
+	b->sj_air_ticks = 0;
+	b->sj_hops = 0;
+	b->sj_peak = 0;
+	b->sj_cmd_fwd = b->sj_cmd_side = b->sj_cmd_up = 0;
+}
+
+static void SJ_Abort (bot_t *b, const char *why)
+{
+	Bot_LogSJ (b, why, b->sj_hops, b->sj_peak);
+	Bot_StrafeReset (b);
+	b->sj_cooldown = level.time + SJ_COOLDOWN;
+}
+
+/*
+=================
+Bot_StrafeThink
+
+Returns true while the controller owns this frame's movement intent (the
+caller then skips path following and stuck recovery; the goal budget keeps
+billing -- travel is faster than budgeted).  NO random() calls in here:
+capability-off runs must keep the RNG stream byte-identical to baseline.
+=================
+*/
+qboolean Bot_StrafeThink (bot_t *b)
+{
+	edict_t	*ent = b->ent;
+	vec3_t	v2, d, tgt;
+	float	speed, desired_heading, yaw;
+	int		node;
+
+	if (bot_strafejump->value == 0)
+	{
+		if (b->sj_state != SJ_NONE)
+			Bot_StrafeReset (b);	// cvar flipped off mid-chain
+		return false;
+	}
+
+	// hard vetoes: combat owns the facing; water/lift own the movement
+	if (b->enemy || ent->waterlevel > 0 || b->lift_state != LIFT_NONE)
+	{
+		if (b->sj_state == SJ_ACTIVE)
+			SJ_Abort (b, b->enemy ? "abort_enemy" : "abort_env");
+		return false;
+	}
+
+	v2[0] = ent->velocity[0];
+	v2[1] = ent->velocity[1];
+	v2[2] = 0;
+	speed = VectorLength (v2);
+
+	if (b->sj_state == SJ_NONE)
+	{
+		int		end, side;
+		float	err;
+
+		if (level.time < b->sj_cooldown || level.time < b->sj_next_check)
+			return false;
+		if (!ent->groundentity || speed < SJ_ENGAGE_SPEED)
+			return false;
+		// a pending landing lockout would eat the takeoff (the parity clear
+		// only runs while the controller is active)
+		if (ent->client->ps.pmove.pm_flags & PMF_TIME_LAND)
+			return false;
+
+		b->sj_next_check = level.time + SJ_CHECK_INTERVAL;
+		end = SJ_QualifyRunway (b);
+		if (end < 0)
+			return false;
+
+		VectorSubtract (nav.nodes[b->path[end]].origin, ent->s.origin, d);
+		d[2] = 0;
+		if (VectorLength (d) < 1)
+			return false;
+		desired_heading = vectoyaw (d);
+
+		// initial strafe side: whichever pulls the velocity toward the spine
+		err = SJ_AngleNorm (desired_heading - vectoyaw (v2));
+		side = (err > 0) ? -1 : +1;
+
+		if (!SJ_SimFirstHop (b, desired_heading, side))
+		{
+			sj_diag[SJ_DIAG_PRESIM]++;
+			b->sj_cooldown = level.time + SJ_COOLDOWN;
+			return false;
+		}
+
+		sj_diag[SJ_DIAG_ENGAGE]++;
+		b->sj_state = SJ_ACTIVE;
+		b->sj_end_idx = end;
+		b->sj_side = side;
+		b->sj_air_ticks = 0;
+		b->sj_hops = 0;
+		b->sj_peak = speed;
+		// diag fields repurposed at engage: hops = runway node count,
+		// peak = the qualified chord length
+		Bot_LogSJ (b, "engage", end - b->path_idx + 1, VectorLength (d));
+		// fall through: produce this frame's takeoff cmd below
+	}
+
+	// stale runway (a replan rebuilt the path under us)
+	if (b->sj_end_idx < b->path_idx || b->sj_end_idx >= b->path_len)
+	{
+		SJ_Abort (b, "abort_path");
+		return false;
+	}
+
+	// advance past nodes we've reached or overflown (the follower's 48u
+	// arrival radius is too tight at 40-55u per tick)
+	while (b->path_idx <= b->sj_end_idx)
+	{
+		node = b->path[b->path_idx];
+		if (node < 0 || node >= nav.num_nodes)
+		{
+			SJ_Abort (b, "abort_path");
+			return false;
+		}
+		VectorSubtract (nav.nodes[node].origin, ent->s.origin, d);
+		d[2] = 0;
+		if (VectorLength (d) < 80)
+		{
+			b->path_idx++;
+			continue;
+		}
+		if (b->path_idx < b->sj_end_idx)
+		{
+			vec3_t	segd;
+			VectorSubtract (nav.nodes[b->path[b->path_idx + 1]].origin,
+							nav.nodes[node].origin, segd);
+			segd[2] = 0;
+			if (DotProduct (d, segd) < 0)
+			{
+				b->path_idx++;	// node fell behind us relative to the spine
+				continue;
+			}
+		}
+		break;
+	}
+	if (b->path_idx > b->sj_end_idx)
+	{
+		// runway consumed: clean hand-back, momentum kept
+		Bot_LogSJ (b, "done", b->sj_hops, b->sj_peak);
+		Bot_StrafeReset (b);
+		b->sj_cooldown = level.time + 0.3f;
+		return false;			// the follower steers this frame
+	}
+
+	// grounded with little chord left: try extending through a gentle bend
+	// BEFORE deciding this hop.  A seamless extension keeps the chain (and
+	// its speed) alive around a curve -- the user's capture carves exactly
+	// this way; handing back instead costs a full-friction ground tick that
+	// resets everything above ~300.
+	if (ent->groundentity && speed > 60)
+	{
+		VectorSubtract (nav.nodes[b->path[b->sj_end_idx]].origin, ent->s.origin, d);
+		d[2] = 0;
+		if (VectorLength (d) < speed * 0.55f)
+		{
+			int nend = SJ_QualifyRunway (b);
+			if (nend > b->sj_end_idx)
+				b->sj_end_idx = nend;
+		}
+	}
+
+	// spine target: the furthest runway node within the lookahead (smooths
+	// the node-to-node zig-zag into one heading)
+	{
+		float	acc = 0;
+		vec3_t	prev;
+		int		k, tn = b->path[b->path_idx];
+
+		VectorCopy (ent->s.origin, prev);
+		for (k = b->path_idx; k <= b->sj_end_idx; k++)
+		{
+			VectorSubtract (nav.nodes[b->path[k]].origin, prev, d);
+			d[2] = 0;
+			acc += VectorLength (d);
+			tn = b->path[k];
+			if (acc > SJ_LOOKAHEAD)
+				break;
+			VectorCopy (nav.nodes[b->path[k]].origin, prev);
+		}
+		VectorCopy (nav.nodes[tn].origin, tgt);
+	}
+	VectorSubtract (tgt, ent->s.origin, d);
+	d[2] = 0;
+	if (VectorLength (d) < 1)
+	{
+		Bot_LogSJ (b, "done", b->sj_hops, b->sj_peak);
+		Bot_StrafeReset (b);
+		b->sj_cooldown = level.time + 0.5f;
+		return false;
+	}
+	desired_heading = vectoyaw (d);
+
+	// drifted off the spine?
+	if (speed > 60
+		&& fabs (SJ_AngleNorm (desired_heading - vectoyaw (v2))) > SJ_HEAD_ERR_MAX)
+	{
+		SJ_Abort (b, "abort_drift");
+		return false;
+	}
+
+	if (ent->groundentity)
+	{
+		// between hops: decide whether the runway still funds another one
+		float	remain;
+
+		if (b->sj_hops > 0 && speed < SJ_ABORT_SPEED)
+		{
+			SJ_Abort (b, "abort_slow");
+			return false;
+		}
+
+		VectorSubtract (nav.nodes[b->path[b->sj_end_idx]].origin, ent->s.origin, d);
+		d[2] = 0;
+		remain = VectorLength (d);
+		if (remain < speed * 0.55f)
+		{
+			// not enough runway for a full hop (and no extension was found):
+			// hand back with the momentum kept
+			Bot_LogSJ (b, "done", b->sj_hops, b->sj_peak);
+			Bot_StrafeReset (b);
+			b->sj_cooldown = level.time + 0.3f;
+			return false;
+		}
+
+		// re-verify the stretch we're about to fly over
+		if (!SJ_SegmentClear (ent, ent->s.origin, tgt))
+		{
+			SJ_Abort (b, "abort_blocked");
+			return false;
+		}
+
+		// pick this hop's strafe side: pull the velocity back toward the
+		// spine (alternates naturally on a straight, holds through a curve)
+		if (speed > 60)
+		{
+			float err = SJ_AngleNorm (desired_heading - vectoyaw (v2));
+			b->sj_side = (err > 0) ? -1 : +1;
+		}
+
+		b->sj_air_ticks = 0;
+		b->sj_hops++;
+		b->sj_cmd_up = 350;		// takeoff (landing frames re-jump friction-free)
+		if (bot_sjlog->value != 0)
+			Bot_LogSJ (b, "hop", b->sj_hops, speed);
+	}
+	else
+	{
+		b->sj_air_ticks++;
+		// one release tick clears PMF_JUMP_HELD; then hold jump so the
+		// landing tick re-jumps regardless of where in the 100ms it lands
+		b->sj_cmd_up = (b->sj_air_ticks == 1) ? 0 : 350;
+	}
+
+	yaw = SJ_FacingYaw (ent->velocity, b->sj_side, desired_heading);
+	b->sj_cmd_fwd  = 400;
+	b->sj_cmd_side = (short)(400 * b->sj_side);
+
+	// keep a sane world-space intent too: it feeds the debug draw and the
+	// one-frame combat-acquisition fallback before the abort lands
+	Bot_SetMoveYaw (b, yaw);
+
+	if (speed > b->sj_peak)
+		b->sj_peak = speed;
+	return true;
+}
+
 /*
 =================
 Bot_FollowPath
@@ -863,11 +1475,99 @@ void Bot_Fidget (bot_t *b, vec3_t anchor)
 	}
 }
 
+/*
+=================
+Bot_WallSlide
+
+Preventive de-pinning (bot_wallslide): if the move intent drives into a roughly
+vertical wall, deflect it ALONG the wall instead of straight into it, so the bot
+rounds the corner rather than pressing the wall until the 1s stuck timer trips
+and recovery kicks in.  Where the approach is shallow the natural slide direction
+is the projection of the intent onto the wall plane; where it's near-perpendicular
+(projection ~0) we probe both tangents and take the one with more clearance.
+Updates move_yaw too, so the look-ahead/facing follows the slide (the whole point
+is that the bot stops staring at the wall).  Never during lifts/water/exploring --
+those layers own the intent (plat columns, swim exits, void-edge stops).
+=================
+*/
+#define WALLSLIDE_PROBE		24.0f
+static void Bot_WallSlide (bot_t *b)
+{
+	edict_t	*ent = b->ent;
+	vec3_t	fwd, start, end, tang, slide, up = {0, 0, 1};
+	trace_t	tr;
+	float	along, slen;
+
+	if (bot_wallslide->value == 0)
+		return;
+	if (!ent->groundentity || Bot_Swimming (ent) || b->lift_state != LIFT_NONE)
+		return;
+	if (b->mode == BOT_MODE_EXPLORE)
+		return;						// wander/StepIsSafe own explore steering
+
+	VectorCopy (b->move_dir, fwd);
+	fwd[2] = 0;
+	if (VectorNormalize (fwd) < 0.1f)
+		return;
+
+	// box-trace the bot's own hull a short step ahead
+	VectorCopy (ent->s.origin, start);
+	VectorMA (start, WALLSLIDE_PROBE, fwd, end);
+	tr = gi.trace (start, ent->mins, ent->maxs, end, ent, MASK_PLAYERSOLID);
+	if (tr.fraction > 0.7f)
+		return;						// mostly clear ahead: not pinned
+	if (tr.plane.normal[2] > 0.5f || tr.plane.normal[2] < -0.5f)
+		return;						// a ramp/step/ceiling, not a wall -- Pmove handles it
+
+	// wall tangent (horizontal), signed toward the intent's glancing direction
+	CrossProduct (up, tr.plane.normal, tang);
+	tang[2] = 0;
+	if (VectorNormalize (tang) < 0.1f)
+		return;
+	along = DotProduct (fwd, tang);
+	if (along < 0)
+		VectorScale (tang, -1, tang);
+
+	// near-perpendicular hit: the signed tangent is ambiguous -- probe both ways
+	// and slide toward whichever side is more open.
+	if (fabs (along) < 0.35f)
+	{
+		vec3_t	le, re;
+		trace_t	lt, rt;
+		VectorMA (start, WALLSLIDE_PROBE, tang, re);
+		lt = gi.trace (start, ent->mins, ent->maxs, re, ent, MASK_PLAYERSOLID);
+		VectorMA (start, -WALLSLIDE_PROBE, tang, le);
+		rt = gi.trace (start, ent->mins, ent->maxs, le, ent, MASK_PLAYERSOLID);
+		if (rt.fraction > lt.fraction)
+			VectorScale (tang, -1, tang);
+	}
+
+	// preserve the original horizontal speed magnitude along the new heading
+	slen = sqrt (b->move_dir[0] * b->move_dir[0] + b->move_dir[1] * b->move_dir[1]);
+	VectorScale (tang, slen, slide);
+	slide[2] = b->move_dir[2];
+	VectorCopy (slide, b->move_dir);
+	b->move_yaw = vectoyaw (tang);
+}
+
 void Bot_ApplyMovement (bot_t *b, usercmd_t *cmd, float facing_yaw)
 {
 	vec3_t	a = {0, 0, 0}, f, r, u;
 	float	speed = bot_forwardspeed->value;
 	float	fm, sm;
+
+	// strafe jumping: the controller computed the exact usercmd (forward and
+	// side BOTH saturated -- the unit projection below would cap the diagonal
+	// at ~283/283 and kill the wishdir angle the yaw law depends on).  Only
+	// while combat hasn't grabbed the facing; if an enemy appeared this frame
+	// we fall through to the normal projection and abort next frame.
+	if (bot_strafejump->value != 0 && b->sj_state == SJ_ACTIVE && !b->enemy)
+	{
+		cmd->forwardmove = b->sj_cmd_fwd;
+		cmd->sidemove    = b->sj_cmd_side;
+		cmd->upmove      = b->sj_cmd_up;
+		return;
+	}
 
 	// avoid wandering into void/lava (explore only; combat & learned paths are
 	// allowed to take known drops)
@@ -879,6 +1579,8 @@ void Bot_ApplyMovement (bot_t *b, usercmd_t *cmd, float facing_yaw)
 		b->next_wander_time = level.time;	// turn away next frame
 		return;
 	}
+
+	Bot_WallSlide (b);	// deflect intent along a wall it's about to pin against
 
 	a[YAW] = facing_yaw;
 	AngleVectors (a, f, r, u);

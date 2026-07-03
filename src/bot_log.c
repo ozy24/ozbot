@@ -171,6 +171,49 @@ void Bot_LogEvent (bot_t *b, const char *event)
 
 /*
 =================
+Bot_LogInput
+
+bot_inputlog: one record per frame of a REAL player's usercmd_t -- the exact
+inputs a .dm2 demo doesn't carry (forward/side/up move, jump = up>0, attack, and
+the per-frame view yaw/pitch sweep), plus the state the player is acting from
+(origin/velocity/ground).  Useful for analysing how a human performs a maneuver
+(movement/jumps).  Feeds tools/input_view.py; recorded via ozbot/record_inputs.bat.
+Caller gates on bot_inputlog and !Bot_IsClient so bots are excluded.
+=================
+*/
+void Bot_LogInput (edict_t *ent, usercmd_t *ucmd)
+{
+	int		slot;
+	float	vx, vy, vz, spd;
+
+	if (!log_fp || !ent || !ent->client || !ucmd)
+		return;
+
+	slot = (int)(ent - g_edicts) - 1;
+	vx = ent->velocity[0];
+	vy = ent->velocity[1];
+	vz = ent->velocity[2];
+	spd = (float)sqrt (vx * vx + vy * vy);
+
+	fprintf (log_fp,
+		"{\"type\":\"input\",\"t\":%.2f,\"slot\":%d,\"msec\":%d,"
+		"\"fwd\":%d,\"side\":%d,\"up\":%d,\"atk\":%d,"
+		"\"yaw\":%.2f,\"pitch\":%.2f,"
+		"\"x\":%.1f,\"y\":%.1f,\"z\":%.1f,"
+		"\"vx\":%.1f,\"vy\":%.1f,\"vz\":%.1f,\"spd\":%.1f,"
+		"\"onground\":%s,\"water\":%d}\n",
+		level.time, slot, (int)ucmd->msec,
+		(int)ucmd->forwardmove, (int)ucmd->sidemove, (int)ucmd->upmove,
+		(ucmd->buttons & BUTTON_ATTACK) ? 1 : 0,
+		SHORT2ANGLE (ucmd->angles[YAW]), SHORT2ANGLE (ucmd->angles[PITCH]),
+		ent->s.origin[0], ent->s.origin[1], ent->s.origin[2],
+		vx, vy, vz, spd,
+		ent->groundentity ? "true" : "false",
+		(int)ent->waterlevel);
+}
+
+/*
+=================
 Bot_LogItemEvent
 
 Like Bot_LogEvent but with an "item" field (pickup / goal_item / item_lost).
@@ -355,6 +398,66 @@ void Bot_LogPenalize (bot_t *b, int from, int to)
 		level.time, b->id,
 		from, to, nav.nodes[from].origin[2], nav.nodes[to].origin[2],
 		b->ent->s.origin[0], b->ent->s.origin[1], b->ent->s.origin[2]);
+}
+
+/*
+=================
+Bot_LogSJ
+
+bot_sjlog: strafe-jump controller events -- "engage", per-takeoff "hop",
+"done", "abort_*" -- with the engage's hop count and peak 2D speed.
+=================
+*/
+void Bot_LogSJ (bot_t *b, const char *phase, int hops, float peak)
+{
+	edict_t	*ent;
+	float	spd;
+
+	if (!log_fp || !bot_sjlog || bot_sjlog->value == 0)
+		return;
+	if (!b || !b->ent)
+		return;
+
+	ent = b->ent;
+	spd = (float)sqrt (ent->velocity[0] * ent->velocity[0]
+					 + ent->velocity[1] * ent->velocity[1]);
+
+	fprintf (log_fp,
+		"{\"type\":\"sj\",\"phase\":\"%s\",\"t\":%.2f,\"bot\":%d,"
+		"\"hops\":%d,\"peak\":%.1f,\"spd\":%.1f,"
+		"\"x\":%.1f,\"y\":%.1f,\"z\":%.1f}\n",
+		phase, level.time, b->id,
+		hops, peak, spd,
+		ent->s.origin[0], ent->s.origin[1], ent->s.origin[2]);
+}
+
+/*
+=================
+Bot_LogSJDiag
+
+bot_sjlog >= 2: periodic dump of the strafe-jump qualification funnel, so the
+runway thresholds can be tuned against what actually stops candidates.
+=================
+*/
+void Bot_LogSJDiag (void)
+{
+	static float next;
+
+	if (!log_fp || !bot_sjlog || bot_sjlog->value < 2)
+		return;
+	if (level.time < next)
+		return;
+	next = level.time + 10.0f;
+
+	fprintf (log_fp,
+		"{\"type\":\"sjdiag\",\"t\":%.2f,\"qualify\":%d,\"link\":%d,"
+		"\"dz\":%d,\"turn\":%d,\"trace\":%d,\"short\":%d,"
+		"\"presim\":%d,\"engage\":%d}\n",
+		level.time,
+		sj_diag[SJ_DIAG_QUALIFY], sj_diag[SJ_DIAG_LINK],
+		sj_diag[SJ_DIAG_DZ], sj_diag[SJ_DIAG_TURN],
+		sj_diag[SJ_DIAG_TRACE], sj_diag[SJ_DIAG_SHORT],
+		sj_diag[SJ_DIAG_PRESIM], sj_diag[SJ_DIAG_ENGAGE]);
 }
 
 /*

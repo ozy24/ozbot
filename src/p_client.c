@@ -1583,6 +1583,11 @@ void ClientThink (edict_t *ent, usercmd_t *ucmd)
 	level.current_entity = ent;
 	client = ent->client;
 
+	// bot_inputlog: capture a real player's raw usercmd trace (jump analysis).
+	// Bots are driven through this same ClientThink; exclude them.
+	if (bot_inputlog->value != 0 && !Bot_IsClient (ent))
+		Bot_LogInput (ent, ucmd);
+
 	if (level.intermissiontime)
 	{
 		client->ps.pmove.pm_type = PM_FREEZE;
