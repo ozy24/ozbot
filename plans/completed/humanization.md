@@ -1,6 +1,47 @@
 # Plan: humanization — make the bots walk, look, and fight like humans
 
-Status: **proposed** (not started)
+Status: **DONE** (executed 2026-07-03; all six behaviors validated and default ON)
+
+## Results (final binary, post-review fixes; see PLAN.md Phase 18 for the full record)
+
+- **Humanness**: mean KS distance across the 8 profiled features 0.333 → **0.206**
+  (−38%). Pitch KS 0.67→0.12, view-vs-travel offset 0.22→0.09, yaw autocorrelation
+  → 0.52 (human 0.57; stock is white noise ≈0), the snap tail collapsed (yaw-rate
+  W1 123 → 28 deg/s), jumps 4→12.9/min (human 15.4), time-still 25%→21%.
+  One feature regressed: strafe_interval 0.12→0.23 (hop landing jitter in the
+  view-frame metric — documented in KNOWN_ISSUES).
+- **Strength budget**: full stack on the standard rig, 10 pooled seeds:
+  frags **−4.6%**, ITEM **+2.0pt**, pickups +3.6% — inside the ≤10%/≤3pt budget.
+  Asymmetric id-parity (humanized vs stock in one match, final binary, 16+16
+  seeds): kill ratio 0.818 vs 0.946 control ≈ **−13.5% relative** — the honest
+  price of losing 360° vision, paid deliberately (Phase 3).
+- Per-phase acceptance: P1 wash (+4.3% frags); P2 parity 0.906 vs 0.892 after
+  retuning (first cut cost 38% — correlated error needs ~0.45x the white-noise
+  magnitude, and reversal overshoot must be rate-limited or hopping targets
+  trigger it every few ticks); P3 −0.3% frags symmetric after adding hearing
+  (weapon noise <700u acquires through the cone); P4 parity 1.171
+  (strength-POSITIVE, as predicted); P5 −0.5pt ITEM.
+- Map spot checks: q2dm3 ITEM +2.4pt, q2dm8 +2.2pt, q2dm5 +3.2pt. On open maps
+  the stack lowers combat *tempo* (q2dm5 frags −40%, deaths −28%, K/D flat):
+  FOV'd, bouncing bots simply engage less on long sightlines. Style, not defect;
+  noted in KNOWN_ISSUES.
+- Phase 0 profiler shipped as `tools/humanness.py` (+ `dm2parse.py` viewangles/
+  health/serverframe extraction, `pitch` in tick telemetry). Corpus caches under
+  `demos/derived/humanness/`. The measured ranking rewrote the plan's hand-ranked
+  tell table: pitch lock and stillness were the loudest tells, strafe metronome
+  near the bottom.
+- Post-validation adversarial review found and fixed 7 real defects: weapon-noise
+  memory stuck open across map changes; an RNG-order violation vs stock (random()
+  in ResetNavState); respawned bots re-acquiring their killer cone-free with no
+  reaction (b->enemy survived death); the reversal-overshoot detector seeded with
+  the bot's own facing; telemetry quantizing angular rates (%.1f → %.2f); the
+  profiler's view-snap filter censoring the stock bot's genuine 170–180° snaps
+  (removing it *worsened* the stock baseline honestly); and a one-frame lag bug
+  in the wander re-pick restructure that broke stock parity. Same-binary
+  determinism re-verified byte-for-byte afterward; all headline numbers above
+  re-measured on the final binary.
+- The eyeball test (validation ladder step 3) is handed to the user: spectate
+  with `play_spectate.bat` / play against the default build.
 Target: the bot's *observable behavior distributions* (gaze, turning, aim texture,
 combat rhythm) move measurably toward human demo distributions, under an explicit
 strength budget (below). This is a **style** goal, not a strength goal.
