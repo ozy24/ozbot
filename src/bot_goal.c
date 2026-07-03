@@ -379,7 +379,7 @@ qboolean Goal_Select (bot_t *b)
 			rejected[best] = 1;	// consumed (reachable or not)
 
 			node = Nav_NearestNode (cand[best]->s.origin);
-			len = Nav_FindPath (start, node, pathbuf, BOT_MAX_PATH);
+			len = Nav_FindPathMasked (start, node, Bot_NavMask (b), pathbuf, BOT_MAX_PATH);
 			if (len <= 0)
 				continue;		// unreachable from here; try the next best
 

@@ -49,6 +49,22 @@ Verification standard, per project convention:
 
 ## Phase A — capability-masked A* (`bot_navmask`) — smallest, do first
 
+> **RESULT (2026-07-03): mechanism landed, default stays OFF.** Bit-exact
+> gates passed (mask off, and mask on with all capabilities on, both md5-equal
+> to baseline). But the runtime value case FAILED its 8-seed A/B: with
+> `bot_swim 0`, masking water routes cost 235→190 pickups / ITEM 54→48%
+> (bots still paddle through water via raw pmove and collect the Railgun
+> opportunistically — deliberate 3D steering is what bot_swim adds, water is
+> not *untraversable* without it); with `bot_lift 0` the mask was a wash
+> (ITEM 47→47%). **Capability-off ≠ link-impossible: traversal is
+> probabilistic, not binary**, so hard-masking runtime routing removes real
+> (degraded) pickup opportunities along with the doomed attempts. Two
+> findings for the record: (1) the learner NEVER stamps `NAV_LINK_WATER` —
+> water-ness lives on node flags, so the WATER mask bit excludes links into
+> `NAV_FLAG_WATER` nodes instead; (2) the mask stays valuable as Phase C
+> oracle infrastructure, where it is used *hypothetically* (classify what
+> unlocks an item) rather than to steer live routing.
+
 The `PathFlags` idea: A* may only expand links whose type the querying bot
 can execute.
 

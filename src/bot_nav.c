@@ -423,10 +423,14 @@ int Nav_NearestVisibleNode (vec3_t origin, edict_t *ignore)
 
 /*
 =================
-Nav_FindPath
+Nav_FindPath / Nav_FindPathMasked
 
 A* from start to goal over node centers.  Writes the node sequence (including
 both endpoints) into out[] and returns its length, or 0 if unreachable.
+
+The masked form only expands links whose type bit is set in 'mask' (see
+NAV_MASK in bot_nav.h), so pathing can honor a bot's capability config --
+e.g. exclude PLAT links for a lift-off bot -- without touching the graph.
 =================
 */
 static float	nav_path_cost;	// g-cost of the last successful Nav_FindPath
@@ -437,6 +441,11 @@ float Nav_LastPathCost (void)
 }
 
 int Nav_FindPath (int start, int goal, int *out, int max)
+{
+	return Nav_FindPathMasked (start, goal, NAV_MASK_ALL, out, max);
+}
+
+int Nav_FindPathMasked (int start, int goal, int mask, int *out, int max)
 {
 	static float	gscore[NAV_MAX_NODES];
 	static float	fscore[NAV_MAX_NODES];
@@ -497,6 +506,14 @@ int Nav_FindPath (int start, int goal, int *out, int max)
 		{
 			int		nb = n->links[i].to;
 			float	tentative;
+			if (!(mask & NAV_MASK (n->links[i].type)))
+				continue;	// link type outside the caller's capabilities
+			// the learner records swim traversals as WALK links between
+			// water-flagged NODES (NAV_LINK_WATER is never stamped on links),
+			// so the water capability masks by destination node: a swimless
+			// bot must not be routed through deep water
+			if (!(mask & NAV_MASK (NAV_LINK_WATER)) && (nav.nodes[nb].flags & NAV_FLAG_WATER))
+				continue;
 			if (closed[nb])
 				continue;
 			tentative = gscore[cur] + n->links[i].cost;

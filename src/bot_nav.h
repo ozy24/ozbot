@@ -31,6 +31,16 @@ NOTE: include "g_local.h" and "bot.h" before this header.
 #define NAV_LINK_WATER		4
 #define NAV_LINK_PLAT		5		// carried up by a func_plat (one-way; bot_lift)
 
+// capability masks for filtered pathfinding (bot_navmask): bit (1 << type)
+// lets A* expand links of that type.  Masks never touch the graph itself --
+// interpretation happens at path time, so one shared graph serves any
+// capability configuration (a lift-off bot routes around PLAT links instead
+// of attempting rides it can't execute).  The WATER bit is special: the
+// learner stamps water-ness on NODES (NAV_FLAG_WATER), not links, so
+// clearing the WATER bit also excludes links into water-flagged nodes.
+#define NAV_MASK(t)			(1 << (t))
+#define NAV_MASK_ALL		0xff
+
 // node flags
 #define NAV_FLAG_WATER		1
 
@@ -71,6 +81,7 @@ int  Nav_SeedNode (vec3_t origin);					// ensure+connect a node here
 int  Nav_NearestNode (vec3_t origin);				// nearest node, or -1
 int  Nav_NearestVisibleNode (vec3_t origin, edict_t *ignore);	// nearest with a clear walk, or -1
 int  Nav_FindPath (int start, int goal, int *out, int max);	// A*; returns node count
+int  Nav_FindPathMasked (int start, int goal, int mask, int *out, int max);	// A* over NAV_MASK-allowed link types
 float Nav_LastPathCost (void);						// g-cost of the last successful A*
 void Nav_PenalizeLink (int from, int to);			// learn an untraversable edge
 qboolean Nav_CanWalk (vec3_t from, vec3_t to, edict_t *ignore);	// clear player-sized path?

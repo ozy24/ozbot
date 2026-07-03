@@ -157,6 +157,9 @@ qboolean Bot_IsClient (edict_t *ent);	// true for DLL-driven bots (no net client
 void G_UnicastClient (edict_t *ent, qboolean reliable);	// gi.unicast, skips bots
 // true if some OTHER active bot already has 'it' as its current goal_item
 qboolean Bot_ItemClaimed (edict_t *it, bot_t *self);
+// A* link-type mask for this bot: capabilities toggled off exclude their
+// link types from pathing (bot_navmask; NAV_MASK_ALL passthrough when off)
+int Bot_NavMask (bot_t *b);
 
 extern cvar_t	*bot_count;
 extern cvar_t	*bot_forwardspeed;
@@ -171,6 +174,7 @@ extern cvar_t	*bot_pathcost;
 extern cvar_t	*bot_goalbudget;
 extern cvar_t	*bot_budgetcap;
 extern cvar_t	*bot_itemfail;
+extern cvar_t	*bot_navmask;
 extern cvar_t	*bot_swim;
 extern cvar_t	*bot_lift;
 extern cvar_t	*bot_liftlog;

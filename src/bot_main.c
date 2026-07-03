@@ -34,6 +34,7 @@ cvar_t	*bot_pathcost;
 cvar_t	*bot_goalbudget;
 cvar_t	*bot_budgetcap;
 cvar_t	*bot_itemfail;
+cvar_t	*bot_navmask;
 cvar_t	*bot_swim;
 cvar_t	*bot_lift;
 cvar_t	*bot_liftlog;
@@ -86,6 +87,8 @@ void Bot_Init (void)
 	bot_goalbudget   = gi.cvar ("bot_goalbudget", "1", 0);	// goal timeout scaled to route cost, not flat 12s
 	bot_budgetcap    = gi.cvar ("bot_budgetcap", "15", 0);	// max seconds to fund any one goal route
 	bot_itemfail     = gi.cvar ("bot_itemfail", "1", 0);	// escalating shared blacklist for items bots keep failing
+	bot_navmask      = gi.cvar ("bot_navmask", "0", 0);		// A* skips link types whose capability cvar is off
+															// (plans/nav-oracle.md Phase A)
 	bot_swim         = gi.cvar ("bot_swim", "1", 0);		// 3D steering in water (vertical swim + water-jump exits)
 	bot_lift         = gi.cvar ("bot_lift", "1", 0);		// the lift capability: plat links, wait/board/ride
 															// controller, 3D column arrival, level-aware homing
@@ -248,6 +251,33 @@ qboolean Bot_ItemClaimed (edict_t *it, bot_t *self)
 			return true;
 	}
 	return false;
+}
+
+/*
+=================
+Bot_NavMask
+
+Link types this bot's A* may expand (bot_navmask; plans/nav-oracle.md).  A
+capability toggled off excludes its link types from pathing, so one shared
+graph serves any capability config: a lift-off bot routes AROUND plat links
+instead of committing budget to a ride it can't execute (and a lift-matured
+graph no longer needs swapping out for lift-off A/B runs).  Returns
+NAV_MASK_ALL when the cvar is off (legacy behavior: every link is
+path-eligible).  Takes the bot so a future per-bot capability-parity harness
+(bot_skilltest-style) gets the right signature for free.
+=================
+*/
+int Bot_NavMask (bot_t *b)
+{
+	int	mask = NAV_MASK_ALL;
+
+	if (bot_navmask->value == 0)
+		return mask;
+	if (bot_swim->value == 0)
+		mask &= ~NAV_MASK (NAV_LINK_WATER);
+	if (bot_lift->value == 0)
+		mask &= ~NAV_MASK (NAV_LINK_PLAT);
+	return mask;
 }
 
 /*
@@ -681,7 +711,7 @@ static void Bot_Navigate (bot_t *b)
 		if (b->path_len <= 0 || b->path_idx >= b->path_len)
 		{
 			int start = Nav_NearestNode (ent->s.origin);
-			b->path_len = Nav_FindPath (start, b->goal_node, b->path, BOT_MAX_PATH);
+			b->path_len = Nav_FindPathMasked (start, b->goal_node, Bot_NavMask (b), b->path, BOT_MAX_PATH);
 			b->path_idx = 0;
 			if (b->path_len <= 0)
 			{
@@ -756,7 +786,7 @@ static void Bot_Navigate (bot_t *b)
 					Bot_LogPenalize (b, b->path[b->path_idx - 1], b->path[b->path_idx]);
 				}
 				start = Nav_NearestNode (ent->s.origin);
-				b->path_len = Nav_FindPath (start, b->goal_node, b->path, BOT_MAX_PATH);
+				b->path_len = Nav_FindPathMasked (start, b->goal_node, Bot_NavMask (b), b->path, BOT_MAX_PATH);
 				b->path_idx = 0;
 				b->replan_time = level.time + 1.5;
 				if (b->path_len <= 0)
@@ -819,7 +849,7 @@ static void Bot_Navigate (bot_t *b)
 
 		if (goal >= 0 && (goal != start || b->goal_item))
 		{
-			int len = Nav_FindPath (start, goal, b->path, BOT_MAX_PATH);
+			int len = Nav_FindPathMasked (start, goal, Bot_NavMask (b), b->path, BOT_MAX_PATH);
 			if (len > 1 || (b->goal_item && len >= 1))
 			{
 				b->path_len = len;
