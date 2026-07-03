@@ -1,6 +1,19 @@
 # Plan: nav taxonomy, capability-masked A*, and the reachability oracle
 
-Status: **PROPOSED** (2026-07-03). Prior art: q2repro's re-release nav API
+Status: **DONE** (2026-07-03, same day as proposed). Phases A-C landed (see
+per-phase RESULT blocks): the oracle passed its acceptance test untuned and
+made two discoveries (seeded-island shadowing; giveups are execution
+failures). Phase A's runtime masking lost its value A/B and stays default
+OFF -- the mask survives as oracle infrastructure. Phase D skipped per its
+own gate: no re-release install / Q2Game.kpf / .nav data exists on this
+machine (searched Steam+GoG paths and the repo); when the rerelease is
+installed, restart from `q2repro/src/server/nav.c` (`NAV3` magic, the
+loader is the format reference). Phase E stays deferred; Discovery 1
+supersedes it with a far cheaper candidate (connected-node preference).
+Net: zero behavior change at default config (tick-stream md5-proven), new
+diagnostics on by default (bot_reachlog), one candidate lever queued.
+
+Prior art: q2repro's re-release nav API
 (`q2repro/inc/shared/game.h` — `PathRequest`/`PathInfo`/`PathFlags`,
 `inc/server/nav.h` — link taxonomy, `src/server/nav.c` — 1.5k-line reference
 implementation with pluggable weight/accessibility callbacks).
