@@ -12,7 +12,7 @@ REM Override the install location with:  set Q2DIR=C:\path\to\quake2
 setlocal enabledelayedexpansion
 cd /d "%~dp0..\q2pro"
 
-if "%Q2DIR%"=="" set "Q2DIR=E:\Projects\ozbot\engine"
+if "%Q2DIR%"=="" set "Q2DIR=%~dp0..\engine"
 
 REM --- meson/ninja live in the pip user scripts dir; put it on PATH ---
 for /f "usebackq tokens=*" %%i in (`py -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"`) do set "PYSCRIPTS=%%i"
