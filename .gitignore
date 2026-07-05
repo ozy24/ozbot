@@ -9,6 +9,7 @@ build/
 
 # Intermediate files
 *.def
+!src/game.def
 *.exp
 *.lib
 *.pdb
@@ -41,4 +42,8 @@ build/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Python
+__pycache__/
+*.pyc
 
