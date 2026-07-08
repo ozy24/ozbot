@@ -197,8 +197,11 @@ by synthesizing a `usercmd_t` and calling `ClientThink`. Bots are fully visible 
   head-to-head A/Bs (kills are the clean metric; deaths have a parity bias — see memory).
 - `humanness.py` — humanness profiler: distance of bot behavior distributions from a human
   input capture (KS stats; plans/completed/humanization.md).
-- `dm2_combat.py` — aim turn-rate / weapon-at-kill / pickup-pattern extraction from pro demos
-  (combat calibration; transfer was a null result — see the demo-combat-calibration memory).
+- `dm2_combat.py` — combat/resource extraction from pro demos. `scan`: aim turn-rate /
+  weapon-at-kill / pickup patterns (combat-execution transfer was a null result — see the
+  demo-combat-calibration memory). `need`: per-category health/ammo/weapon status *at pickup*
+  across all maps → `demos/derived/combat_need/thresholds.json` (the source of ozbot-re's
+  demo-calibrated `bot_ammoneed`/`bot_wpnneed`; see the ozbot-re-resource-need-win memory).
 - `nav_add_route.py` — targeted nav surgery: merge a demo-recorded route into a .nav graph
   (kept from the lift work; wholesale demo import remains rejected).
 - `nav_transplant_costs.py` — transplant learned link costs between .nav graphs (from the

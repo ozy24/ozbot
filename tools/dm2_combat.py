@@ -13,7 +13,14 @@ modifies that directory -- same pattern as demo_to_nav.py / demo_coverage.py).
 
 Usage:
     python dm2_combat.py scan [mapname] [--limit N]   -> aggregate stats
+    python dm2_combat.py need [mapname] [--limit N]   -> resource-need thresholds
+                                                          (all maps if mapname omitted)
     python dm2_combat.py one <demo.dm2>                -> single-demo debug dump
+
+The `need` subcommand mines the human "resource need" curves the bot's goal
+scorer wants (bot_goal.c Item_Score): at what health/armor/ammo level do pros
+actually detour to pick a thing up.  It writes durable calibration targets to
+demos/derived/combat_need/thresholds.json.
 """
 
 import glob
@@ -65,6 +72,58 @@ VIEWMODEL_WEAPON = {
     "v_launch": "grenade launcher", "v_rocket": "rocket launcher",
     "v_hyperb": "hyperblaster", "v_rail": "railgun", "v_bfg": "bfg10k",
 }
+
+# ammo type each weapon consumes (canonical weapon names as resolve_weapon emits
+# them).  Used to bucket "how much ammo did they have" by the ammo type that
+# matters -- absolute counts are only comparable within a type (rockets cap 50,
+# cells cap 200).  Blaster has no ammo.
+WEAPON_AMMO = {
+    "shotgun": "shells", "super shotgun": "shells",
+    "machinegun": "bullets", "chaingun": "bullets",
+    "grenade launcher": "grenades", "rocket launcher": "rockets",
+    "hyperblaster": "cells", "bfg10k": "cells",
+    "railgun": "slugs",
+}
+
+# substring -> ammo type, for classifying an ammo PICKUP item by its name
+AMMO_ITEM_TYPE = [
+    ("Shells", "shells"), ("Bullets", "bullets"), ("Cells", "cells"),
+    ("Rockets", "rockets"), ("Slugs", "slugs"), ("Grenades", "grenades"),
+]
+
+
+def item_category(name):
+    """Coarse item class from its configstring pickup name -- mirrors the
+    vocabulary of bot_goal.c Item_BaseValue so the analysis and the bot agree."""
+    n = name.lower()
+    # ammo first: "Grenades" is ammo, the "Grenade Launcher" weapon is caught below
+    for sub, _ in AMMO_ITEM_TYPE:
+        if sub.lower() in n and "launcher" not in n:
+            return "ammo"
+    if "armor" in n or "shard" in n:
+        return "armor"
+    if any(w in n for w in (
+            "shotgun", "machinegun", "chaingun", "launcher", "hyperblaster",
+            "railgun", "bfg", "blaster", "grenade launcher")):
+        return "weapon"
+    if any(p in n for p in (
+            "quad", "invulnerability", "silencer", "rebreather", "environment",
+            "adrenaline", "bandolier", "pack", "power shield", "power screen")):
+        return "powerup"
+    if "health" in n or "mega" in n or "stimpack" in n or "medkit" in n:
+        return "health"
+    return "other"
+
+
+def ammo_item_type(name):
+    """Ammo type of an ammo PICKUP item (or None)."""
+    n = name.lower()
+    if "launcher" in n:
+        return None
+    for sub, atype in AMMO_ITEM_TYPE:
+        if sub.lower() in n:
+            return atype
+    return None
 
 # obituary vocabulary, from p_client.c's Obituary() -- "%s %s %s%s\n".
 # Matched by substring search (see parse_obituary), not a generic regex --
@@ -164,6 +223,11 @@ def parse_combat(data):
     last_viewangles = None
     last_weapon = None
     frame_idx = 0
+    # one-frame-behind snapshot: the decision state BEFORE a pickup mutates it
+    # (a health/ammo/weapon pickup bumps STAT_HEALTH/STAT_AMMO on the same frame
+    # the pickup edge fires, so the pickup-frame value is post-pickup-inflated).
+    prev_health = prev_armor = prev_ammo = 0
+    prev_weapon = None
 
     for block in iter_blocks(data):
         if not block:
@@ -217,13 +281,22 @@ def parse_combat(data):
                         last_weapon = wi
                     if stats[STAT_PICKUP_STRING]:
                         idx = stats[STAT_PICKUP_STRING] - CS_ITEMS
+                        # log the PRE-pickup snapshot (the state that drove the
+                        # decision to grab it), not the post-pickup inflated stats
                         info["pickups"].append(
-                            (frame_idx, idx, stats[STAT_HEALTH], stats[STAT_ARMOR]))
+                            (frame_idx, idx, prev_health, prev_armor,
+                             prev_ammo, prev_weapon))
                         stats[STAT_PICKUP_STRING] = 0   # one-shot; only log the edge
                     if last_origin is not None and last_viewangles is not None:
                         info["samples"].append(
                             (frame_idx, last_viewangles[0], last_viewangles[1],
-                             last_weapon, stats[STAT_HEALTH], stats[STAT_ARMOR]))
+                             last_weapon, stats[STAT_HEALTH], stats[STAT_ARMOR],
+                             stats[STAT_AMMO]))
+                    # snapshot this frame's state as the "before" for the next frame
+                    prev_health = stats[STAT_HEALTH]
+                    prev_armor = stats[STAT_ARMOR]
+                    prev_ammo = stats[STAT_AMMO]
+                    prev_weapon = last_weapon
                     frame_idx += 1
                 break
             elif cmd in (SVC_DISCONNECT, SVC_RECONNECT):
@@ -288,8 +361,8 @@ def scan(mapname, limit):
 
         samp = info["samples"]
         for i in range(1, len(samp)):
-            f0, y0, p0, w0, h0, a0 = samp[i - 1]
-            f1, y1, p1, w1, h1, a1 = samp[i]
+            f0, y0, p0, w0, h0, a0, am0 = samp[i - 1]
+            f1, y1, p1, w1, h1, a1, am1 = samp[i]
             if f1 != f0 + 1:
                 continue    # dropped/duplicated frame -- don't blend the rate
             dy = abs(((y1 - y0) + 180) % 360 - 180)
@@ -298,13 +371,13 @@ def scan(mapname, limit):
                 continue    # respawn/teleport view snap, not real aim movement
             turn_rates.append(dy + dp)
 
-        for frame_idx, yaw, pitch, weapon_idx, health, armor in samp:
+        for frame_idx, yaw, pitch, weapon_idx, health, armor, ammo in samp:
             w = resolve_weapon(info["models"], weapon_idx)
             if w:
                 equip_time[w] += 1
 
         last_pickup_frame = None
-        for frame_idx, idx, health, armor in info["pickups"]:
+        for frame_idx, idx, health, armor, ammo, weapon_idx in info["pickups"]:
             item = info["items"].get(idx, f"item#{idx}")
             pickup_item_counts[item] += 1
             pickup_health[item].append(health)
@@ -363,6 +436,206 @@ def scan(mapname, limit):
     }
 
 
+def _pctile(xs, p):
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    k = min(int(len(xs) * p), len(xs) - 1)
+    return xs[k]
+
+
+def _summ(xs):
+    return {
+        "n": len(xs),
+        "p10": _pctile(xs, 0.10), "p25": _pctile(xs, 0.25),
+        "p50": _pctile(xs, 0.50), "p75": _pctile(xs, 0.75),
+        "p90": _pctile(xs, 0.90),
+        "mean": round(sum(xs) / len(xs), 1) if xs else 0.0,
+    }
+
+
+def need(mapname, limit):
+    """Mine human resource-need thresholds across the corpus (all maps by
+    default): at what health/armor/ammo did pros decide to grab each item
+    category.  Writes demos/derived/combat_need/thresholds.json."""
+    import datetime
+
+    pickup_state = defaultdict(lambda: defaultdict(list))  # cat -> field -> [vals]
+    ammo_by_type = defaultdict(list)   # ammo type -> [pre_ammo] on a matched top-up
+    ammo_health = []                   # health at any ammo pickup
+    ammo_match = ammo_mismatch = ammo_noweapon = 0
+    wsw = {"n": 0, "switched": 0, "delays": []}
+    wsw_by = defaultdict(lambda: {"n": 0, "switched": 0, "delays": []})
+    equip_time = Counter()
+    kill_weapon_counts = Counter()
+    maps = Counter()
+    demos_ok = demos_bad = 0
+
+    for name, data in iter_zip_demos(mapname, limit):
+        try:
+            info = parse_combat(data)
+        except Exception:
+            demos_bad += 1
+            continue
+        if not info["samples"]:
+            demos_bad += 1
+            continue
+        demos_ok += 1
+        if info["map"]:
+            maps[info["map"]] += 1
+        models = info["models"]
+
+        # weapon held per frame (for weapon-switch detection + equip-time share)
+        frame_weap = {}
+        for s in info["samples"]:
+            fw = resolve_weapon(models, s[3])
+            if fw:
+                frame_weap[s[0]] = fw
+                equip_time[fw] += 1
+
+        for frame_idx, idx, pre_h, pre_a, pre_ammo, pre_widx in info["pickups"]:
+            item = info["items"].get(idx, "")
+            if not item:
+                continue
+            cat = item_category(item)
+            held = resolve_weapon(models, pre_widx)
+            if cat == "health":
+                pickup_state["health"]["health"].append(pre_h)
+                pickup_state["health"]["armor"].append(pre_a)
+            elif cat == "armor":
+                pickup_state["armor"]["armor"].append(pre_a)
+                pickup_state["armor"]["health"].append(pre_h)
+            elif cat == "weapon":
+                pickup_state["weapon"]["health"].append(pre_h)
+                picked = item.lower()      # matches resolve_weapon output
+                wsw["n"] += 1
+                wsw_by[picked]["n"] += 1
+                for d in range(1, 21):     # scan forward up to ~2s (20 frames)
+                    if frame_weap.get(frame_idx + d) == picked:
+                        wsw["switched"] += 1
+                        wsw["delays"].append(d * 100)
+                        wsw_by[picked]["switched"] += 1
+                        wsw_by[picked]["delays"].append(d * 100)
+                        break
+            elif cat == "ammo":
+                ammo_health.append(pre_h)
+                atype = ammo_item_type(item)
+                held_ammo = WEAPON_AMMO.get(held) if held else None
+                # stat 3 is ammo for the CURRENTLY-HELD weapon, so it's only the
+                # right "how low was I" reading when the ammo they grabbed feeds
+                # the gun in their hands -- the deliberate top-up we want to model.
+                if held_ammo is None:
+                    ammo_noweapon += 1
+                elif atype and atype == held_ammo:
+                    ammo_by_type[atype].append(pre_ammo)
+                    ammo_match += 1
+                else:
+                    ammo_mismatch += 1
+
+        me = info["names"].get(info["playernum"], "").lower()
+        for frame_idx, victim, attacker, weapon in info["kills"]:
+            if me and attacker.lower() == me:
+                kill_weapon_counts[weapon] += 1
+
+    total_eq = sum(equip_time.values()) or 1
+    total_kills = sum(kill_weapon_counts.values()) or 1
+
+    out = {
+        "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "corpus": {
+            "demos_parsed": demos_ok, "demos_skipped": demos_bad,
+            "maps": dict(maps.most_common()),
+        },
+        "pickup_need": {
+            "health": {
+                "health_at_pickup": _summ(pickup_state["health"]["health"]),
+                "armor_at_pickup": _summ(pickup_state["health"]["armor"]),
+            },
+            "armor": {
+                "armor_at_pickup": _summ(pickup_state["armor"]["armor"]),
+                "health_at_pickup": _summ(pickup_state["armor"]["health"]),
+            },
+            "ammo": {
+                "health_at_pickup": _summ(ammo_health),
+                "matched_pickups": ammo_match,
+                "mismatched_pickups": ammo_mismatch,
+                "no_owned_weapon_pickups": ammo_noweapon,
+                "by_ammo_type": {t: _summ(v) for t, v in sorted(ammo_by_type.items())},
+            },
+            "weapon": {
+                "health_at_pickup": _summ(pickup_state["weapon"]["health"]),
+            },
+        },
+        "weapon_switch": {
+            "n_weapon_pickups": wsw["n"],
+            "switched_within_2s_pct":
+                round(100.0 * wsw["switched"] / wsw["n"], 1) if wsw["n"] else 0.0,
+            "switch_delay_ms": {"p50": _pctile(wsw["delays"], 0.5),
+                                "p90": _pctile(wsw["delays"], 0.9)},
+            "by_weapon": {
+                w: {"n": d["n"],
+                    "switched_pct":
+                        round(100.0 * d["switched"] / d["n"], 1) if d["n"] else 0.0,
+                    "delay_ms_p50": _pctile(d["delays"], 0.5)}
+                for w, d in sorted(wsw_by.items(), key=lambda kv: -kv[1]["n"])
+            },
+        },
+        "weapon_equipped_pct":
+            {w: round(100.0 * c / total_eq, 1) for w, c in equip_time.most_common()},
+        "weapon_at_kill_pct":
+            {w: round(100.0 * c / total_kills, 1) for w, c in kill_weapon_counts.most_common()},
+        "calibration": {
+            "bot_healthneed": {
+                "urgency_health_p50": _pctile(pickup_state["health"]["health"], 0.5),
+                "note": "median health at which pros top up; urgency curve should already pull by here",
+            },
+            "bot_ammoneed": {
+                "low_threshold_by_ammo":
+                    {t: _pctile(v, 0.5) for t, v in sorted(ammo_by_type.items())},
+                "note": "p50 of ammo-for-held-weapon at the moment they refilled that ammo type",
+            },
+            "bot_wpnneed": {
+                "kill_rank": [w for w, _ in kill_weapon_counts.most_common()],
+            },
+        },
+    }
+
+    outdir = os.path.join(ROOT, "demos", "derived", "combat_need")
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, "thresholds.json")
+    with open(outpath, "w") as f:
+        json.dump(out, f, indent=2)
+
+    # ---- console summary ----
+    print(f"\n=== {mapname or 'ALL MAPS'}: {demos_ok} demos parsed, {demos_bad} skipped ===")
+    print(f"maps: {dict(maps.most_common(8))}{' ...' if len(maps) > 8 else ''}\n")
+
+    def line(tag, s):
+        print(f"  {tag:22s} n={s['n']:7d}  p25={s['p25']:5.0f} p50={s['p50']:5.0f} "
+              f"p75={s['p75']:5.0f}  mean={s['mean']:5.1f}")
+
+    print("-- HEALTH: player state when they picked up a health item --")
+    line("health-at-pickup", _summ(pickup_state["health"]["health"]))
+    line("armor-at-pickup", _summ(pickup_state["health"]["armor"]))
+    print("\n-- ARMOR: player state when they picked up an armor item --")
+    line("armor-at-pickup", _summ(pickup_state["armor"]["armor"]))
+    line("health-at-pickup", _summ(pickup_state["armor"]["health"]))
+    print("\n-- AMMO: ammo-for-held-weapon when refilling THAT ammo type --")
+    print(f"  (matched top-ups={ammo_match}  mismatched={ammo_mismatch}  "
+          f"no-owned-weapon={ammo_noweapon})")
+    for t, v in sorted(ammo_by_type.items()):
+        line(t, _summ(v))
+    line("health-at-ammo-pickup", _summ(ammo_health))
+    print("\n-- WEAPON: switch to a freshly-grabbed gun within 2s --")
+    print(f"  {out['weapon_switch']['switched_within_2s_pct']:.1f}% of "
+          f"{wsw['n']} weapon pickups; delay p50="
+          f"{out['weapon_switch']['switch_delay_ms']['p50']}ms")
+    print("  weapon-at-kill %: " + ", ".join(
+        f"{w} {p}" for w, p in list(out["weapon_at_kill_pct"].items())[:8]))
+    print(f"\n-> wrote {outpath}")
+    return out
+
+
 def one(path):
     data = open(path, "rb").read()
     info = parse_combat(data)
@@ -372,7 +645,10 @@ def one(path):
     print("items seen:", {k: v for k, v in list(info["items"].items())[:10]})
     for p in info["pickups"][:10]:
         idx = p[1]
-        print("pickup:", info["items"].get(idx, f"#{idx}"), "health=", p[2], "armor=", p[3])
+        w = resolve_weapon(info["models"], p[5])
+        print("pickup:", info["items"].get(idx, f"#{idx}"),
+              "pre_health=", p[2], "pre_armor=", p[3], "pre_ammo=", p[4],
+              "holding=", w)
     for k in info["kills"][:10]:
         print("kill:", k)
     weapons = Counter()
@@ -397,4 +673,7 @@ if __name__ == "__main__":
         for a in rest:
             if a.startswith("--limit"):
                 limit = int(a.split("=", 1)[1]) if "=" in a else int(rest[rest.index(a) + 1])
-        result = scan(mapname, limit)
+        if cmd == "need":
+            result = need(mapname, limit)
+        else:
+            result = scan(mapname, limit)
