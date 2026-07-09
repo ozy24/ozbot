@@ -15,6 +15,9 @@ Usage:
     python dm2_combat.py scan [mapname] [--limit N]   -> aggregate stats
     python dm2_combat.py need [mapname] [--limit N]   -> resource-need thresholds
                                                           (all maps if mapname omitted)
+    python dm2_combat.py tactics [mapname] [--limit N] -> per-weapon engagement
+                                                          range + style (decodes
+                                                          opponent positions)
     python dm2_combat.py one <demo.dm2>                -> single-demo debug dump
 
 The `need` subcommand mines the human "resource need" curves the bot's goal
@@ -60,6 +63,20 @@ PS_BLEND, PS_FOV, PS_WEAPONINDEX, PS_WEAPONFRAME, PS_RDFLAGS = 1024, 2048, 4096,
 
 STAT_HEALTH, STAT_AMMO, STAT_ARMOR = 1, 3, 5
 STAT_PICKUP_ICON, STAT_PICKUP_STRING, STAT_SELECTED_ITEM, STAT_FRAGS = 7, 8, 12, 14
+
+SVC_PACKETENTITIES = 18
+
+# entity-delta update bits (protocol 34, quake2 qcommon/qcommon.h U_*).  Used by
+# the `tactics` subcommand to decode opponent origins from the packet-entities
+# section (for per-weapon engagement RANGE); ignored by scan/need.
+U_ORIGIN1, U_ORIGIN2, U_ANGLE2, U_ANGLE3 = 1 << 0, 1 << 1, 1 << 2, 1 << 3
+U_FRAME8, U_EVENT, U_REMOVE, U_MOREBITS1 = 1 << 4, 1 << 5, 1 << 6, 1 << 7
+U_NUMBER16, U_ORIGIN3, U_ANGLE1, U_MODEL = 1 << 8, 1 << 9, 1 << 10, 1 << 11
+U_RENDERFX8, U_EFFECTS8, U_MOREBITS2 = 1 << 12, 1 << 14, 1 << 15
+U_SKIN8, U_FRAME16, U_RENDERFX16, U_EFFECTS16 = 1 << 16, 1 << 17, 1 << 18, 1 << 19
+U_MODEL2, U_MODEL3, U_MODEL4, U_MOREBITS3 = 1 << 20, 1 << 21, 1 << 22, 1 << 23
+U_OLDORIGIN, U_SKIN16, U_SOUND, U_SOLID = 1 << 24, 1 << 25, 1 << 26, 1 << 27
+MAX_EDICTS = 1024
 
 CS_ITEMS = 1056     # = CS_LIGHTS + MAX_LIGHTSTYLES, per dm2parse's CS_PLAYERSKINS comment
 CS_MODELS = 32
@@ -170,16 +187,17 @@ def angle16(v):
 
 
 def read_playerinfo(r, stats):
-    """Decodes what dm2parse skips: viewangles, weaponindex, stats deltas.
-    Returns (origin_or_None, viewangles_or_None, weaponindex_or_None)."""
+    """Decodes what dm2parse skips: viewangles, weaponindex, velocity, stats.
+    Returns (origin, viewangles, weaponindex, velocity); each None if absent.
+    origin is raw s16 (world = /8); velocity is world units/sec (already /8)."""
     flags = r.u16()
-    origin = viewangles = weaponindex = None
+    origin = viewangles = weaponindex = velocity = None
     if flags & PS_M_TYPE:
         r.skip(1)
     if flags & PS_M_ORIGIN:
         origin = (r.s16(), r.s16(), r.s16())
     if flags & PS_M_VELOCITY:
-        r.skip(6)
+        velocity = (r.s16() / 8.0, r.s16() / 8.0, r.s16() / 8.0)
     if flags & PS_M_TIME:
         r.skip(1)
     if flags & PS_M_FLAGS:
@@ -208,26 +226,150 @@ def read_playerinfo(r, stats):
     for i in range(32):
         if statbits & (1 << i):
             stats[i] = r.s16()
-    return origin, viewangles, weaponindex
+    return origin, viewangles, weaponindex, velocity
 
 
-def parse_combat(data):
+# ---- packet-entity (delta) decoding: opponent origins for the `tactics` scan ----
+
+def _read_ent_bits(r):
+    """Read an entity-delta header: the U_* bitmask (up to 4 bytes) + the entity
+    number (byte, or short if U_NUMBER16).  Number 0 terminates the list."""
+    bits = r.u8()
+    if bits & U_MOREBITS1:
+        bits |= r.u8() << 8
+    if bits & U_MOREBITS2:
+        bits |= r.u8() << 16
+    if bits & U_MOREBITS3:
+        bits |= r.u8() << 24
+    num = r.u16() if (bits & U_NUMBER16) else r.u8()
+    return bits, num
+
+
+def _parse_delta_origin(r, bits):
+    """Consume one entity delta's fields in protocol-34 order (CL_ParseDelta),
+    returning (ox,oy,oz) world-unit coords for whichever origin components were
+    sent (None for the rest).  Non-origin fields are read only to stay aligned."""
+    if bits & U_MODEL:  r.u8()
+    if bits & U_MODEL2: r.u8()
+    if bits & U_MODEL3: r.u8()
+    if bits & U_MODEL4: r.u8()
+    if bits & U_FRAME8:  r.u8()
+    if bits & U_FRAME16: r.u16()
+    if (bits & U_SKIN8) and (bits & U_SKIN16): r.s32()
+    elif bits & U_SKIN8:  r.u8()
+    elif bits & U_SKIN16: r.u16()
+    if (bits & U_EFFECTS8) and (bits & U_EFFECTS16): r.s32()
+    elif bits & U_EFFECTS8:  r.u8()
+    elif bits & U_EFFECTS16: r.u16()
+    if (bits & U_RENDERFX8) and (bits & U_RENDERFX16): r.s32()
+    elif bits & U_RENDERFX8:  r.u8()
+    elif bits & U_RENDERFX16: r.u16()
+    ox = r.s16() / 8.0 if (bits & U_ORIGIN1) else None
+    oy = r.s16() / 8.0 if (bits & U_ORIGIN2) else None
+    oz = r.s16() / 8.0 if (bits & U_ORIGIN3) else None
+    if bits & U_ANGLE1: r.u8()
+    if bits & U_ANGLE2: r.u8()
+    if bits & U_ANGLE3: r.u8()
+    if bits & U_OLDORIGIN: r.skip(6)
+    if bits & U_SOUND: r.u8()
+    if bits & U_EVENT: r.u8()
+    if bits & U_SOLID: r.u16()
+    return ox, oy, oz
+
+
+def _apply_delta(origins, num, bits, r):
+    ox, oy, oz = _parse_delta_origin(r, bits)
+    cur = origins.get(num)
+    if cur is None:
+        cur = [0.0, 0.0, 0.0]
+        origins[num] = cur
+    if ox is not None: cur[0] = ox
+    if oy is not None: cur[1] = oy
+    if oz is not None: cur[2] = oz
+
+
+def _parse_packetentities(r, origins):
+    """Apply one frame's delta-entity list to the persistent origins dict.
+    Deltas are incremental against the previous frame, so `origins` must persist
+    across frames; unset fields keep their prior value.  U_REMOVE drops an entity."""
+    while True:
+        bits, num = _read_ent_bits(r)
+        if num == 0:
+            break
+        if num >= MAX_EDICTS:
+            raise ValueError("bad entity number")
+        if bits & U_REMOVE:
+            origins.pop(num, None)
+            continue
+        _apply_delta(origins, num, bits, r)
+
+
+def _parse_baseline(r, origins):
+    """svc_spawnbaseline = a single entity delta (same format); seed its origin."""
+    bits, num = _read_ent_bits(r)
+    if bits & U_REMOVE:
+        return
+    if 0 < num < MAX_EDICTS:
+        _apply_delta(origins, num, bits, r)
+    else:
+        _parse_delta_origin(r, bits)   # consume fields to stay aligned
+
+
+def _record_engage(info, frame_idx, last_origin, last_velocity, weapon_idx, origins, opps):
+    """Log this frame's engagement geometry vs the nearest opponent: distance and
+    the velocity component toward the enemy (>0 closing, <0 retreating)."""
+    if last_origin is None or not opps:
+        return
+    rx, ry = last_origin[0] / 8.0, last_origin[1] / 8.0
+    best = None
+    for en in opps:
+        o = origins.get(en)
+        if o is None:
+            continue
+        d = math.hypot(o[0] - rx, o[1] - ry)
+        if best is None or d < best[0]:
+            best = (d, o)
+    if best is None:
+        return
+    dist, o = best
+    adv = speed = 0.0
+    if last_velocity is not None:
+        vx, vy = last_velocity[0], last_velocity[1]
+        speed = math.hypot(vx, vy)
+        tx, ty = o[0] - rx, o[1] - ry
+        tl = math.hypot(tx, ty)
+        if tl > 1e-3 and speed > 1e-3:
+            adv = (vx * tx + vy * ty) / tl   # velocity toward enemy, units/sec
+    info["engage"].append((frame_idx, weapon_idx, dist, adv, speed))
+
+
+def parse_combat(data, entities=False):
+    """Decode the recording player's per-frame state + pickups + kills.  With
+    entities=True, also decode the packet-entities section for opponent origins
+    (engagement RANGE / STYLE and kill-range) -- the `tactics` scan; scan/need
+    call with entities=False, which is byte-for-byte the prior behavior."""
     info = {"map": None, "playernum": None, "names": {}, "items": {}, "models": {},
-            "samples": [], "pickups": [], "kills": []}
+            "samples": [], "pickups": [], "kills": [], "engage": [], "killrange": []}
     m = re.search(rb"maps/([A-Za-z0-9_]+)\.bsp", data)
     if m:
         info["map"] = m.group(1).decode()
 
     stats = [0] * 32
-    last_origin = None
+    last_origin = None          # recorder origin, raw s16 (world = /8)
     last_viewangles = None
     last_weapon = None
+    last_velocity = None
+    origins = {}                # entity number -> [x,y,z] world units (entities mode)
     frame_idx = 0
     # one-frame-behind snapshot: the decision state BEFORE a pickup mutates it
     # (a health/ammo/weapon pickup bumps STAT_HEALTH/STAT_AMMO on the same frame
     # the pickup edge fires, so the pickup-frame value is post-pickup-inflated).
     prev_health = prev_armor = prev_ammo = 0
     prev_weapon = None
+
+    def opp_entnums():
+        me_ent = (info["playernum"] + 1) if info["playernum"] is not None else -1
+        return [cn + 1 for cn in info["names"] if cn + 1 != me_ent]
 
     for block in iter_blocks(data):
         if not block:
@@ -256,6 +398,20 @@ def parse_combat(data):
                 if obit:
                     victim, attacker, weapon = obit
                     info["kills"].append((frame_idx, victim, attacker, weapon))
+                    # kill-range: recorder's own frags, vs the victim's last-known
+                    # origin (from the previous frame's entities -- the obituary
+                    # print precedes this block's packetentities).  Clean combat
+                    # range signal, no firing gate needed.
+                    if entities and last_origin is not None:
+                        me = info["names"].get(info["playernum"], "")
+                        if me and attacker.lower() == me.lower():
+                            vent = next((cn + 1 for cn, nm in info["names"].items()
+                                         if nm.lower() == victim.lower()), None)
+                            vo = origins.get(vent) if vent is not None else None
+                            if vo is not None:
+                                info["killrange"].append((weapon, math.hypot(
+                                    vo[0] - last_origin[0] / 8.0,
+                                    vo[1] - last_origin[1] / 8.0)))
             elif cmd in (SVC_STUFFTEXT, SVC_CENTERPRINT, SVC_LAYOUT):
                 r.string()
             elif cmd == SVC_INVENTORY:
@@ -266,19 +422,28 @@ def parse_combat(data):
                 size = r.s16()
                 if size >= 0:
                     r.u8(); r.skip(size)
+            elif cmd == SVC_SPAWNBASELINE:
+                if not entities:
+                    break                        # scan/need: skip rest of block (as before)
+                try:
+                    _parse_baseline(r, origins)
+                except (IndexError, ValueError):
+                    break
             elif cmd == SVC_FRAME:
                 r.s32(); r.s32(); r.u8()
                 arealen = r.u8()
                 r.skip(arealen)
                 sub = r.u8()
                 if sub == SVC_PLAYERINFO:
-                    o, va, wi = read_playerinfo(r, stats)
+                    o, va, wi, ve = read_playerinfo(r, stats)
                     if o is not None:
                         last_origin = o
                     if va is not None:
                         last_viewangles = va
                     if wi is not None:
                         last_weapon = wi
+                    if ve is not None:
+                        last_velocity = ve
                     if stats[STAT_PICKUP_STRING]:
                         idx = stats[STAT_PICKUP_STRING] - CS_ITEMS
                         # log the PRE-pickup snapshot (the state that drove the
@@ -292,6 +457,18 @@ def parse_combat(data):
                             (frame_idx, last_viewangles[0], last_viewangles[1],
                              last_weapon, stats[STAT_HEALTH], stats[STAT_ARMOR],
                              stats[STAT_AMMO]))
+                    if entities:
+                        # this frame's packetentities follow the playerinfo; decode
+                        # opponent origins, then log the engagement geometry.  A
+                        # desync stays contained to this block (fresh Reader next).
+                        try:
+                            if r.u8() == SVC_PACKETENTITIES:
+                                _parse_packetentities(r, origins)
+                                _record_engage(info, frame_idx, last_origin,
+                                               last_velocity, last_weapon,
+                                               origins, opp_entnums())
+                        except (IndexError, ValueError):
+                            pass
                     # snapshot this frame's state as the "before" for the next frame
                     prev_health = stats[STAT_HEALTH]
                     prev_armor = stats[STAT_ARMOR]
@@ -636,6 +813,102 @@ def need(mapname, limit):
     return out
 
 
+def tactics(mapname, limit):
+    """Per-weapon engagement RANGE + STYLE from the pro corpus (opponent origins
+    decoded from packet entities).  Writes demos/derived/combat_tactics/
+    weapon_profiles.json -- the calibration source for the bot's weapon-aware
+    combat (preferred-range bands + advance/retreat style)."""
+    import datetime
+    ENGAGE_CAP = 1200.0   # count engage frames only when an opponent is this near (in-fight)
+    ADV_THRESH = 60.0     # |velocity toward enemy| (u/s) to call advance/retreat vs neutral
+
+    krange = defaultdict(list)                 # weapon -> [kill distance]
+    erange = defaultdict(list)                 # weapon -> [engage distance < CAP]
+    espeed = defaultdict(list)                 # weapon -> [speed while engaged]
+    estyle = defaultdict(lambda: [0, 0, 0])    # weapon -> [advance, retreat, neutral]
+    maps = Counter()
+    demos_ok = demos_bad = 0
+
+    for name, data in iter_zip_demos(mapname, limit):
+        try:
+            info = parse_combat(data, entities=True)
+        except Exception:
+            demos_bad += 1
+            continue
+        if not info["samples"]:
+            demos_bad += 1
+            continue
+        demos_ok += 1
+        if info["map"]:
+            maps[info["map"]] += 1
+
+        for weapon, dist in info["killrange"]:
+            if weapon in ("telefrag", "?"):
+                continue
+            krange[weapon].append(dist)
+
+        for frame_idx, widx, dist, adv, speed in info["engage"]:
+            if dist > ENGAGE_CAP:
+                continue
+            w = resolve_weapon(info["models"], widx)
+            if not w:
+                continue
+            erange[w].append(dist)
+            espeed[w].append(speed)
+            s = estyle[w]
+            if adv > ADV_THRESH:
+                s[0] += 1
+            elif adv < -ADV_THRESH:
+                s[1] += 1
+            else:
+                s[2] += 1
+
+    weapons = sorted(set(krange) | set(erange))
+    out = {
+        "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "corpus": {"demos_parsed": demos_ok, "demos_skipped": demos_bad,
+                   "maps": dict(maps.most_common())},
+        "params": {"engage_cap": ENGAGE_CAP, "advance_thresh": ADV_THRESH},
+        "weapons": {}, "calibration": {"bands": {}, "style": {}},
+    }
+    for w in weapons:
+        st = estyle[w]
+        tot = sum(st) or 1
+        adv_f, ret_f, neu_f = (round(st[0] / tot, 3), round(st[1] / tot, 3),
+                               round(st[2] / tot, 3))
+        out["weapons"][w] = {
+            "kill_range": _summ(krange[w]),
+            "engage_range": _summ(erange[w]),
+            "speed": {"p50": _pctile(espeed[w], 0.5), "p90": _pctile(espeed[w], 0.9)},
+            "advance_frac": adv_f, "retreat_frac": ret_f, "neutral_frac": neu_f,
+            "n_style": sum(st),
+        }
+        # bands prefer kill-range (clean combat range); fall back to engage-range if sparse
+        src = _summ(krange[w]) if len(krange[w]) >= 30 else _summ(erange[w])
+        out["calibration"]["bands"][w] = {"lo": src["p25"], "center": src["p50"], "hi": src["p75"]}
+        out["calibration"]["style"][w] = ("press" if adv_f - ret_f > 0.1 else
+                                          "defensive" if ret_f - adv_f > 0.1 else "hold")
+
+    outdir = os.path.join(ROOT, "demos", "derived", "combat_tactics")
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, "weapon_profiles.json")
+    with open(outpath, "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"\n=== {mapname or 'ALL MAPS'}: {demos_ok} demos parsed, {demos_bad} skipped ===")
+    print(f"maps: {dict(maps.most_common(8))}{' ...' if len(maps) > 8 else ''}\n")
+    print(f"{'weapon':16s} {'killR_p50':>9} {'engR_p50':>9} {'band lo/hi':>13}  "
+          f"{'style':9s} adv/ret")
+    for w in sorted(weapons, key=lambda x: -out["weapons"][x]["kill_range"]["n"]):
+        d = out["weapons"][w]
+        b = out["calibration"]["bands"][w]
+        print(f"{w:16s} {d['kill_range']['p50']:9.0f} {d['engage_range']['p50']:9.0f} "
+              f"{b['lo']:5.0f}/{b['hi']:<6.0f} {out['calibration']['style'][w]:9s} "
+              f"{d['advance_frac']:.2f}/{d['retreat_frac']:.2f}  (killN={d['kill_range']['n']})")
+    print(f"\n-> wrote {outpath}")
+    return out
+
+
 def one(path):
     data = open(path, "rb").read()
     info = parse_combat(data)
@@ -675,5 +948,7 @@ if __name__ == "__main__":
                 limit = int(a.split("=", 1)[1]) if "=" in a else int(rest[rest.index(a) + 1])
         if cmd == "need":
             result = need(mapname, limit)
+        elif cmd == "tactics":
+            result = tactics(mapname, limit)
         else:
             result = scan(mapname, limit)
