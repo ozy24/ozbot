@@ -315,6 +315,64 @@ def _parse_baseline(r, origins):
         _parse_delta_origin(r, bits)   # consume fields to stay aligned
 
 
+def _record_aim(info, frame_idx, last_origin, last_viewangles, weapon_idx,
+                ammo, origins, opps, aim_state):
+    """Log this frame's AIM geometry vs the nearest opponent: the angular error
+    between the recorder's view and the exact bearing to the enemy, the range,
+    and the enemy's LATERAL speed (velocity component perpendicular to the line
+    of sight).  This is the human ground-truth for calibrating the bot's aim
+    error -- how far a human's aim actually sits off a moving/distant target,
+    per weapon.  Additive to info['aim']; only populated in entities mode, so
+    scan/need/tactics are untouched.  Opponent velocity is differenced from the
+    previous frame the same entity was seen (demos are 10Hz)."""
+    if last_origin is None or last_viewangles is None or not opps:
+        return
+    rx, ry, rz = last_origin[0] / 8.0, last_origin[1] / 8.0, last_origin[2] / 8.0
+    best = None
+    for en in opps:
+        o = origins.get(en)
+        if o is None:
+            continue
+        d = math.hypot(o[0] - rx, o[1] - ry)
+        if best is None or d < best[0]:
+            best = (d, en, o)
+    if best is None:
+        return
+    _, en, o = best
+    ex, ey, ez = rx, ry, rz + 22.0          # recorder eye (viewheight ~22)
+    ox, oy, oz = o[0], o[1], o[2] + 22.0     # opponent center approx
+    dx, dy, dz = ox - ex, oy - ey, oz - ez
+    horiz = math.hypot(dx, dy)
+    rng = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if horiz < 1.0 or rng < 1.0:
+        return
+    bear_yaw = math.degrees(math.atan2(dy, dx))
+    bear_pitch = -math.degrees(math.atan2(dz, horiz))   # Q2: +pitch looks down
+    view_pitch, view_yaw = last_viewangles[0], last_viewangles[1]
+
+    def wrap(a):
+        a %= 360.0
+        return a - 360.0 if a > 180.0 else a
+    err_yaw = wrap(view_yaw - bear_yaw)
+    err_pitch = wrap(view_pitch - bear_pitch)
+
+    # opponent lateral speed: horizontal velocity perpendicular to the LOS
+    lat = -1.0
+    prev = aim_state["prev"].get(en)
+    if prev is not None:
+        pfr, po = prev
+        dt = (frame_idx - pfr) * 0.1
+        if dt > 1e-3:
+            vx = (o[0] - po[0]) / dt
+            vy = (o[1] - po[1]) / dt
+            hx, hy = dx / horiz, dy / horiz          # LOS unit (horizontal)
+            along = vx * hx + vy * hy
+            px, py = vx - along * hx, vy - along * hy
+            lat = math.hypot(px, py)
+    aim_state["prev"][en] = (frame_idx, o)
+    info["aim"].append((frame_idx, weapon_idx, rng, err_yaw, err_pitch, lat, ammo))
+
+
 def _record_engage(info, frame_idx, last_origin, last_velocity, weapon_idx, origins, opps):
     """Log this frame's engagement geometry vs the nearest opponent: distance and
     the velocity component toward the enemy (>0 closing, <0 retreating)."""
@@ -349,7 +407,9 @@ def parse_combat(data, entities=False):
     (engagement RANGE / STYLE and kill-range) -- the `tactics` scan; scan/need
     call with entities=False, which is byte-for-byte the prior behavior."""
     info = {"map": None, "playernum": None, "names": {}, "items": {}, "models": {},
-            "samples": [], "pickups": [], "kills": [], "engage": [], "killrange": []}
+            "samples": [], "pickups": [], "kills": [], "engage": [], "killrange": [],
+            "aim": []}
+    aim_state = {"prev": {}}     # opp entnum -> (frame_idx, origin) for velocity
     m = re.search(rb"maps/([A-Za-z0-9_]+)\.bsp", data)
     if m:
         info["map"] = m.group(1).decode()
@@ -464,9 +524,14 @@ def parse_combat(data, entities=False):
                         try:
                             if r.u8() == SVC_PACKETENTITIES:
                                 _parse_packetentities(r, origins)
+                                opps = opp_entnums()
                                 _record_engage(info, frame_idx, last_origin,
                                                last_velocity, last_weapon,
-                                               origins, opp_entnums())
+                                               origins, opps)
+                                _record_aim(info, frame_idx, last_origin,
+                                            last_viewangles, last_weapon,
+                                            stats[STAT_AMMO], origins, opps,
+                                            aim_state)
                         except (IndexError, ValueError):
                             pass
                     # snapshot this frame's state as the "before" for the next frame
@@ -909,6 +974,110 @@ def tactics(mapname, limit):
     return out
 
 
+def aim(mapname, limit):
+    """Human aim-error ground truth (calibration for the bot's Combat_Aim error).
+    For every engaged frame (holding a weapon, an opponent present, view within
+    ~45deg of the enemy) measure |view - exact-bearing| yaw error, bucketed by
+    weapon x range x opponent-lateral-speed.  Also isolates RAILGUN FIRE frames
+    (detected by a slug decrement) -- the cleanest 'how far off is a committed
+    shot' signal.  Writes demos/derived/combat_aim/aim_profiles.json."""
+    import datetime
+    WEAPONS = ["railgun", "blaster", "hyperblaster", "chaingun", "machinegun",
+               "super shotgun"]
+    RB = [("near<300", 0, 300), ("mid300-600", 300, 600), ("far>600", 600, 1e9)]
+    ENG_CONE = 45.0     # view within this of the enemy bearing = "engaging"
+    LAT_SPLIT = 150.0   # opponent lateral speed slow/fast boundary (u/s)
+
+    # weapon -> range-bucket -> lat-class(slow/fast/any) -> [abs err_yaw]
+    buckets = {w: {rb[0]: {"slow": [], "fast": [], "any": []} for rb in RB}
+               for w in WEAPONS}
+    fire_err = defaultdict(list)      # weapon -> [abs err_yaw at fire]
+    latpairs = defaultdict(list)      # weapon -> [(lat, abs err_yaw)]
+    demos_ok = demos_bad = 0
+
+    for name, data in iter_zip_demos(mapname, limit):
+        try:
+            info = parse_combat(data, entities=True)
+        except Exception:
+            demos_bad += 1
+            continue
+        if not info["aim"]:
+            demos_bad += 1
+            continue
+        demos_ok += 1
+        prev_rail_ammo = None
+        for (fr, widx, rng, eyaw, epitch, lat, ammo) in info["aim"]:
+            w = resolve_weapon(info["models"], widx)
+            if w not in buckets:
+                # still track railgun-fire even if not in the table set
+                if w != "railgun":
+                    continue
+            aey = abs(eyaw)
+            # railgun fire detection via slug decrement
+            if w == "railgun":
+                if prev_rail_ammo is not None and ammo < prev_rail_ammo \
+                        and aey < 90.0 and rng < 2000:
+                    fire_err["railgun"].append(aey)
+                prev_rail_ammo = ammo
+            if w not in buckets or aey > ENG_CONE or rng > 1600:
+                continue
+            # find range bucket
+            rbname = next((n for (n, lo, hi) in RB if lo <= rng < hi), None)
+            if not rbname:
+                continue
+            slot = buckets[w][rbname]
+            slot["any"].append(aey)
+            if lat >= 0:
+                latpairs[w].append((lat, aey))
+                slot["fast" if lat >= LAT_SPLIT else "slow"].append(aey)
+
+    out = {
+        "generated": datetime.datetime.now(datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "corpus": {"demos_parsed": demos_ok, "demos_skipped": demos_bad},
+        "params": {"engage_cone_deg": ENG_CONE, "lat_split": LAT_SPLIT,
+                   "range_buckets": [r[0] for r in RB]},
+        "note": "err = |view_yaw - exact_bearing_yaw| in degrees; human ground truth",
+        "weapons": {}, "railgun_fire": _summ(fire_err["railgun"]),
+    }
+    for w in WEAPONS:
+        wd = {}
+        for (rbname, _, _) in RB:
+            s = buckets[w][rbname]
+            wd[rbname] = {
+                "n": len(s["any"]),
+                "err_p50": round(_pctile(s["any"], 0.5), 2),
+                "err_p90": round(_pctile(s["any"], 0.9), 2),
+                "slow_p50": round(_pctile(s["slow"], 0.5), 2),
+                "slow_n": len(s["slow"]),
+                "fast_p50": round(_pctile(s["fast"], 0.5), 2),
+                "fast_n": len(s["fast"]),
+            }
+        out["weapons"][w] = wd
+
+    outdir = os.path.join(ROOT, "demos", "derived", "combat_aim")
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, "aim_profiles.json")
+    with open(outpath, "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"\n=== {mapname or 'ALL MAPS'}: {demos_ok} demos parsed, "
+          f"{demos_bad} skipped -- HUMAN aim-error (deg) ===")
+    print(f"railgun FIRE-frame |err_yaw|: {_summ(fire_err['railgun'])}\n")
+    print(f"{'weapon':14s} {'range':11s} {'n':>6} {'|err|p50':>9} {'p90':>7}  "
+          f"{'slow_p50':>8}(n) {'fast_p50':>8}(n)")
+    for w in WEAPONS:
+        for (rbname, _, _) in RB:
+            d = out["weapons"][w][rbname]
+            if d["n"] < 20:
+                continue
+            print(f"{w:14s} {rbname:11s} {d['n']:6d} {d['err_p50']:9.2f} "
+                  f"{d['err_p90']:7.2f}  {d['slow_p50']:8.2f}({d['slow_n']:>5}) "
+                  f"{d['fast_p50']:8.2f}({d['fast_n']:>5})")
+    print(f"\n-> wrote {outpath}")
+    return out
+
+
 def one(path):
     data = open(path, "rb").read()
     info = parse_combat(data)
@@ -950,5 +1119,7 @@ if __name__ == "__main__":
             result = need(mapname, limit)
         elif cmd == "tactics":
             result = tactics(mapname, limit)
+        elif cmd == "aim":
+            result = aim(mapname, limit)
         else:
             result = scan(mapname, limit)
