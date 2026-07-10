@@ -1101,6 +1101,152 @@ def one(path):
     print("weapon-equipped samples:", weapons.most_common())
 
 
+def timing(mapname, limit):
+    """Item-timing / respawn-cycle analysis.  For the POV pro in each demo, the
+    interval between successive pickups of the SAME major timed item (Mega Health,
+    the armors, power-ups) is bounded below by that item's respawn time -- so the
+    interval distribution reveals BOTH the effective respawn cadence (its lower
+    tail) and how disciplined the pro's re-timing is (how tightly intervals cluster
+    at that floor).  STAT_PICKUP_STRING is the POV player's own HUD notify, so this
+    is exactly the pro whose timing we want to model.  Writes
+    demos/derived/combat_timing/timing.json.  This is an ANALYSIS artifact -- no
+    bot lever is calibrated from it yet; it quantifies how much predictive
+    item-timing pros actually do, per item and per (duel) map, so the value of a
+    predictive pre-positioning behavior can be judged before it is built."""
+    import datetime
+
+    # major timed items worth pre-positioning for (substring match on pickup name)
+    TIMED = ["Mega Health", "Body Armor", "Combat Armor", "Jacket Armor",
+             "Quad Damage", "Invulnerability", "Power Shield", "Power Screen"]
+
+    def timed_name(item):
+        low = item.lower()
+        for t in TIMED:
+            if t.lower() in low:
+                return t
+        return None
+
+    intervals = defaultdict(list)                      # item -> [dt seconds]
+    per_map = defaultdict(lambda: defaultdict(list))   # map -> item -> [dt]
+    demos_with_repeat = defaultdict(int)               # item -> #demos with >=2
+    pickups_total = defaultdict(int)                   # item -> total POV pickups
+    demos_seen_item = defaultdict(int)                 # item -> #demos with >=1
+    demos_ok = demos_bad = 0
+    maps = Counter()
+
+    for name, data in iter_zip_demos(mapname, limit):
+        try:
+            info = parse_combat(data)
+        except Exception:
+            demos_bad += 1
+            continue
+        if not info["pickups"]:
+            demos_bad += 1
+            continue
+        demos_ok += 1
+        mp = info["map"] or "?"
+        maps[mp] += 1
+        seq = defaultdict(list)   # item -> [frame_idx]
+        for frame_idx, idx, ph, pa, pam, pw in info["pickups"]:
+            tn = timed_name(info["items"].get(idx, ""))
+            if tn:
+                seq[tn].append(frame_idx)
+        for tn, frames in seq.items():
+            frames.sort()
+            pickups_total[tn] += len(frames)
+            demos_seen_item[tn] += 1
+            if len(frames) >= 2:
+                demos_with_repeat[tn] += 1
+            for a, b in zip(frames, frames[1:]):
+                dt = (b - a) * 0.1   # 10Hz demo frames -> seconds
+                if 0 < dt < 600:     # drop absurd gaps (level changes, parse holes)
+                    intervals[tn].append(dt)
+                    per_map[mp][tn].append(dt)
+
+    def tightness(xs):
+        """Fraction of intervals within 1.35x the p10 'respawn floor' -- high means
+        the pro re-grabs close to when the item comes back (deliberate timing)."""
+        if len(xs) < 8:
+            return None
+        floor = _pctile(xs, 0.10)
+        if floor <= 0:
+            return None
+        near = sum(1 for v in xs if v <= floor * 1.35)
+        return round(near / len(xs), 3)
+
+    items_out = {}
+    for tn in TIMED:
+        iv = intervals.get(tn, [])
+        items_out[tn] = {
+            "pov_pickups": pickups_total.get(tn, 0),
+            "demos_with_item": demos_seen_item.get(tn, 0),
+            "demos_with_repeat": demos_with_repeat.get(tn, 0),
+            "repeat_demo_pct": round(100.0 * demos_with_repeat.get(tn, 0)
+                                     / max(1, demos_seen_item.get(tn, 0)), 1),
+            "interval_s": _summ(iv) if iv else None,
+            "respawn_floor_s": round(_pctile(iv, 0.10), 1) if iv else None,
+            "timing_tightness": tightness(iv),
+        }
+
+    # per-map cadence for the maps with the most timed-item intervals (duel maps)
+    map_rank = sorted(per_map.keys(),
+                      key=lambda m: -sum(len(v) for v in per_map[m].values()))
+    maps_out = {}
+    for mp in map_rank[:8]:
+        entry = {}
+        for tn, iv in per_map[mp].items():
+            if len(iv) >= 8:
+                entry[tn] = {
+                    "n": len(iv),
+                    "floor_s": round(_pctile(iv, 0.10), 1),
+                    "p50_s": round(_pctile(iv, 0.50), 1),
+                    "tightness": tightness(iv),
+                }
+        if entry:
+            maps_out[mp] = entry
+
+    out = {
+        "generated": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "corpus": {"demos_parsed": demos_ok, "demos_skipped": demos_bad,
+                   "maps": dict(maps.most_common())},
+        "method": ("interval between successive POV pickups of the same timed item; "
+                   "floor=p10~respawn, tightness=frac within 1.35x floor"),
+        "items": items_out,
+        "by_map": maps_out,
+    }
+
+    outdir = os.path.join(ROOT, "demos", "derived", "combat_timing")
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, "timing.json")
+    with open(outpath, "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"\n=== {mapname or 'ALL MAPS'} item-timing: {demos_ok} demos, "
+          f"{demos_bad} skipped ===")
+    print(f"maps: {dict(maps.most_common(6))}{' ...' if len(maps) > 6 else ''}\n")
+    print(f"  {'item':16s} {'povPick':>7s} {'rptDemo%':>8s} {'floor_s':>7s} "
+          f"{'p50_s':>6s} {'tight':>6s}")
+    for tn in TIMED:
+        e = items_out[tn]
+        iv = e["interval_s"]
+        if not iv:
+            print(f"  {tn:16s} {e['pov_pickups']:7d} {'-':>8s} {'-':>7s} "
+                  f"{'-':>6s} {'-':>6s}   (no repeat intervals)")
+            continue
+        print(f"  {tn:16s} {e['pov_pickups']:7d} {e['repeat_demo_pct']:8.1f} "
+              f"{e['respawn_floor_s']:7.1f} {iv['p50']:6.0f} "
+              f"{(e['timing_tightness'] if e['timing_tightness'] is not None else 0):6.2f}")
+    print("\n  per-map floor/p50/tightness (top duel maps):")
+    for mp, entry in list(maps_out.items())[:6]:
+        parts = [f"{tn.split()[0]}:{d['floor_s']:.0f}/{d['p50_s']:.0f}/"
+                 f"{(d['tightness'] if d['tightness'] is not None else 0):.2f}"
+                 for tn, d in entry.items()]
+        print(f"    {mp:10s} " + "  ".join(parts))
+    print(f"\n-> wrote {outpath}")
+    return out
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "scan"
     if cmd == "one":
@@ -1117,6 +1263,8 @@ if __name__ == "__main__":
                 limit = int(a.split("=", 1)[1]) if "=" in a else int(rest[rest.index(a) + 1])
         if cmd == "need":
             result = need(mapname, limit)
+        elif cmd == "timing":
+            result = timing(mapname, limit)
         elif cmd == "tactics":
             result = tactics(mapname, limit)
         elif cmd == "aim":
