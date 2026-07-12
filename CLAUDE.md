@@ -183,6 +183,21 @@ by synthesizing a `usercmd_t` and calling `ClientThink`. Bots are fully visible 
 - `run_parallel.py` — the parallel-sim harness (behind `run_parallel.bat`). Resolves the in-repo
   `engine/` from `tools/` (repo root = one dir above `tools/`); override with `--engine`.
 - `analyze.py` — the main telemetry analyzer; also writes a top-down coverage/failure heatmap PNG.
+- `benchmark.py` — cross-map stats tracker. Runs the standard fastsim rig on every q2dm map from a
+  **pinned** nav baseline (`baselines/nav/<map>.nav`) with a fixed seed, so two snapshots differ
+  only because the *code* changed. Extracts the headline metrics (ITEM completion, pickups, frags,
+  deaths, K/D, nav nodes) per map, appends a dated snapshot (commit + `--note`) to
+  `baselines/benchmark_history.jsonl`, and regenerates the human-facing `STATS.md`. Freezes the
+  built DLL + pinned navs into `engine/ozbot_bench`, so a live `play.bat` can't perturb a run.
+  `py tools/benchmark.py --note "<what changed>"` (all 8 maps, ~30s wall); `--maps q2dm1,q2dm5`
+  to subset; `--report-only` to regenerate `STATS.md` from history. The baseline is **normalized**:
+  `--mature` regrows every map's graph from COLD with one identical rig (11 bots × 720s game, fixed
+  seed) into `baselines/nav/` + `engine/ozbot/nav/`, so no map is advantaged by a longer-lived
+  hand-curated graph — rerun it if the locomotion/nav-learning code changes. (`--pin` instead
+  snapshots the current canonical navs as-is.) Note cold-regenerating discards hand-matured
+  capability routes: q2dm1's swim-gated Railgun isn't reliably rediscovered in a single 720s pass,
+  so its ITEM% reads lower than the README's hand-matured ~42-50% figure — that's the normalized-
+  baseline trade-off, not a regression. See `STATS.md`.
 - `dm2parse.py` — protocol-34 `.dm2` demo parser → recording player's trajectory + map + names.
   Works by reading each length-prefixed block only up to `svc_frame`'s playerinfo, then skipping to
   the next block (avoids parsing sound/temp-entity messages entirely).
