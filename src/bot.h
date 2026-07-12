@@ -285,6 +285,7 @@ extern cvar_t	*bot_aimturn;
 extern cvar_t	*bot_aimerr;
 extern cvar_t	*bot_aimfire;
 extern cvar_t	*bot_aimtexture;
+extern cvar_t	*bot_aimprec;
 extern cvar_t	*bot_fov;
 extern cvar_t	*bot_hop;
 
