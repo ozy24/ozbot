@@ -13,7 +13,17 @@ modifies that directory -- same pattern as demo_to_nav.py / demo_coverage.py).
 
 Usage:
     python dm2_combat.py scan [mapname] [--limit N]   -> aggregate stats
+    python dm2_combat.py need [mapname] [--limit N]   -> resource-need thresholds
+                                                          (all maps if mapname omitted)
+    python dm2_combat.py tactics [mapname] [--limit N] -> per-weapon engagement
+                                                          range + style (decodes
+                                                          opponent positions)
     python dm2_combat.py one <demo.dm2>                -> single-demo debug dump
+
+The `need` subcommand mines the human "resource need" curves the bot's goal
+scorer wants (bot_goal.c Item_Score): at what health/armor/ammo level do pros
+actually detour to pick a thing up.  It writes durable calibration targets to
+demos/derived/combat_need/thresholds.json.
 """
 
 import glob
@@ -30,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dm2parse
 from dm2parse import Reader, iter_blocks
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW = os.path.join(ROOT, "demos", "raw")
 
 # svc ids (protocol 34) not already needed by dm2parse
@@ -54,6 +64,20 @@ PS_BLEND, PS_FOV, PS_WEAPONINDEX, PS_WEAPONFRAME, PS_RDFLAGS = 1024, 2048, 4096,
 STAT_HEALTH, STAT_AMMO, STAT_ARMOR = 1, 3, 5
 STAT_PICKUP_ICON, STAT_PICKUP_STRING, STAT_SELECTED_ITEM, STAT_FRAGS = 7, 8, 12, 14
 
+SVC_PACKETENTITIES = 18
+
+# entity-delta update bits (protocol 34, quake2 qcommon/qcommon.h U_*).  Used by
+# the `tactics` subcommand to decode opponent origins from the packet-entities
+# section (for per-weapon engagement RANGE); ignored by scan/need.
+U_ORIGIN1, U_ORIGIN2, U_ANGLE2, U_ANGLE3 = 1 << 0, 1 << 1, 1 << 2, 1 << 3
+U_FRAME8, U_EVENT, U_REMOVE, U_MOREBITS1 = 1 << 4, 1 << 5, 1 << 6, 1 << 7
+U_NUMBER16, U_ORIGIN3, U_ANGLE1, U_MODEL = 1 << 8, 1 << 9, 1 << 10, 1 << 11
+U_RENDERFX8, U_EFFECTS8, U_MOREBITS2 = 1 << 12, 1 << 14, 1 << 15
+U_SKIN8, U_FRAME16, U_RENDERFX16, U_EFFECTS16 = 1 << 16, 1 << 17, 1 << 18, 1 << 19
+U_MODEL2, U_MODEL3, U_MODEL4, U_MOREBITS3 = 1 << 20, 1 << 21, 1 << 22, 1 << 23
+U_OLDORIGIN, U_SKIN16, U_SOUND, U_SOLID = 1 << 24, 1 << 25, 1 << 26, 1 << 27
+MAX_EDICTS = 1024
+
 CS_ITEMS = 1056     # = CS_LIGHTS + MAX_LIGHTSTYLES, per dm2parse's CS_PLAYERSKINS comment
 CS_MODELS = 32
 CS_PLAYERSKINS = 1312
@@ -65,6 +89,58 @@ VIEWMODEL_WEAPON = {
     "v_launch": "grenade launcher", "v_rocket": "rocket launcher",
     "v_hyperb": "hyperblaster", "v_rail": "railgun", "v_bfg": "bfg10k",
 }
+
+# ammo type each weapon consumes (canonical weapon names as resolve_weapon emits
+# them).  Used to bucket "how much ammo did they have" by the ammo type that
+# matters -- absolute counts are only comparable within a type (rockets cap 50,
+# cells cap 200).  Blaster has no ammo.
+WEAPON_AMMO = {
+    "shotgun": "shells", "super shotgun": "shells",
+    "machinegun": "bullets", "chaingun": "bullets",
+    "grenade launcher": "grenades", "rocket launcher": "rockets",
+    "hyperblaster": "cells", "bfg10k": "cells",
+    "railgun": "slugs",
+}
+
+# substring -> ammo type, for classifying an ammo PICKUP item by its name
+AMMO_ITEM_TYPE = [
+    ("Shells", "shells"), ("Bullets", "bullets"), ("Cells", "cells"),
+    ("Rockets", "rockets"), ("Slugs", "slugs"), ("Grenades", "grenades"),
+]
+
+
+def item_category(name):
+    """Coarse item class from its configstring pickup name -- mirrors the
+    vocabulary of bot_goal.c Item_BaseValue so the analysis and the bot agree."""
+    n = name.lower()
+    # ammo first: "Grenades" is ammo, the "Grenade Launcher" weapon is caught below
+    for sub, _ in AMMO_ITEM_TYPE:
+        if sub.lower() in n and "launcher" not in n:
+            return "ammo"
+    if "armor" in n or "shard" in n:
+        return "armor"
+    if any(w in n for w in (
+            "shotgun", "machinegun", "chaingun", "launcher", "hyperblaster",
+            "railgun", "bfg", "blaster", "grenade launcher")):
+        return "weapon"
+    if any(p in n for p in (
+            "quad", "invulnerability", "silencer", "rebreather", "environment",
+            "adrenaline", "bandolier", "pack", "power shield", "power screen")):
+        return "powerup"
+    if "health" in n or "mega" in n or "stimpack" in n or "medkit" in n:
+        return "health"
+    return "other"
+
+
+def ammo_item_type(name):
+    """Ammo type of an ammo PICKUP item (or None)."""
+    n = name.lower()
+    if "launcher" in n:
+        return None
+    for sub, atype in AMMO_ITEM_TYPE:
+        if sub.lower() in n:
+            return atype
+    return None
 
 # obituary vocabulary, from p_client.c's Obituary() -- "%s %s %s%s\n".
 # Matched by substring search (see parse_obituary), not a generic regex --
@@ -111,16 +187,17 @@ def angle16(v):
 
 
 def read_playerinfo(r, stats):
-    """Decodes what dm2parse skips: viewangles, weaponindex, stats deltas.
-    Returns (origin_or_None, viewangles_or_None, weaponindex_or_None)."""
+    """Decodes what dm2parse skips: viewangles, weaponindex, velocity, stats.
+    Returns (origin, viewangles, weaponindex, velocity); each None if absent.
+    origin is raw s16 (world = /8); velocity is world units/sec (already /8)."""
     flags = r.u16()
-    origin = viewangles = weaponindex = None
+    origin = viewangles = weaponindex = velocity = None
     if flags & PS_M_TYPE:
         r.skip(1)
     if flags & PS_M_ORIGIN:
         origin = (r.s16(), r.s16(), r.s16())
     if flags & PS_M_VELOCITY:
-        r.skip(6)
+        velocity = (r.s16() / 8.0, r.s16() / 8.0, r.s16() / 8.0)
     if flags & PS_M_TIME:
         r.skip(1)
     if flags & PS_M_FLAGS:
@@ -149,21 +226,210 @@ def read_playerinfo(r, stats):
     for i in range(32):
         if statbits & (1 << i):
             stats[i] = r.s16()
-    return origin, viewangles, weaponindex
+    return origin, viewangles, weaponindex, velocity
 
 
-def parse_combat(data):
+# ---- packet-entity (delta) decoding: opponent origins for the `tactics` scan ----
+
+def _read_ent_bits(r):
+    """Read an entity-delta header: the U_* bitmask (up to 4 bytes) + the entity
+    number (byte, or short if U_NUMBER16).  Number 0 terminates the list."""
+    bits = r.u8()
+    if bits & U_MOREBITS1:
+        bits |= r.u8() << 8
+    if bits & U_MOREBITS2:
+        bits |= r.u8() << 16
+    if bits & U_MOREBITS3:
+        bits |= r.u8() << 24
+    num = r.u16() if (bits & U_NUMBER16) else r.u8()
+    return bits, num
+
+
+def _parse_delta_origin(r, bits):
+    """Consume one entity delta's fields in protocol-34 order (CL_ParseDelta),
+    returning (ox,oy,oz) world-unit coords for whichever origin components were
+    sent (None for the rest).  Non-origin fields are read only to stay aligned."""
+    if bits & U_MODEL:  r.u8()
+    if bits & U_MODEL2: r.u8()
+    if bits & U_MODEL3: r.u8()
+    if bits & U_MODEL4: r.u8()
+    if bits & U_FRAME8:  r.u8()
+    if bits & U_FRAME16: r.u16()
+    if (bits & U_SKIN8) and (bits & U_SKIN16): r.s32()
+    elif bits & U_SKIN8:  r.u8()
+    elif bits & U_SKIN16: r.u16()
+    if (bits & U_EFFECTS8) and (bits & U_EFFECTS16): r.s32()
+    elif bits & U_EFFECTS8:  r.u8()
+    elif bits & U_EFFECTS16: r.u16()
+    if (bits & U_RENDERFX8) and (bits & U_RENDERFX16): r.s32()
+    elif bits & U_RENDERFX8:  r.u8()
+    elif bits & U_RENDERFX16: r.u16()
+    ox = r.s16() / 8.0 if (bits & U_ORIGIN1) else None
+    oy = r.s16() / 8.0 if (bits & U_ORIGIN2) else None
+    oz = r.s16() / 8.0 if (bits & U_ORIGIN3) else None
+    if bits & U_ANGLE1: r.u8()
+    if bits & U_ANGLE2: r.u8()
+    if bits & U_ANGLE3: r.u8()
+    if bits & U_OLDORIGIN: r.skip(6)
+    if bits & U_SOUND: r.u8()
+    if bits & U_EVENT: r.u8()
+    if bits & U_SOLID: r.u16()
+    return ox, oy, oz
+
+
+def _apply_delta(origins, num, bits, r):
+    ox, oy, oz = _parse_delta_origin(r, bits)
+    cur = origins.get(num)
+    if cur is None:
+        cur = [0.0, 0.0, 0.0]
+        origins[num] = cur
+    if ox is not None: cur[0] = ox
+    if oy is not None: cur[1] = oy
+    if oz is not None: cur[2] = oz
+
+
+def _parse_packetentities(r, origins):
+    """Apply one frame's delta-entity list to the persistent origins dict.
+    Deltas are incremental against the previous frame, so `origins` must persist
+    across frames; unset fields keep their prior value.  U_REMOVE drops an entity."""
+    while True:
+        bits, num = _read_ent_bits(r)
+        if num == 0:
+            break
+        if num >= MAX_EDICTS:
+            raise ValueError("bad entity number")
+        if bits & U_REMOVE:
+            origins.pop(num, None)
+            continue
+        _apply_delta(origins, num, bits, r)
+
+
+def _parse_baseline(r, origins):
+    """svc_spawnbaseline = a single entity delta (same format); seed its origin."""
+    bits, num = _read_ent_bits(r)
+    if bits & U_REMOVE:
+        return
+    if 0 < num < MAX_EDICTS:
+        _apply_delta(origins, num, bits, r)
+    else:
+        _parse_delta_origin(r, bits)   # consume fields to stay aligned
+
+
+def _record_aim(info, frame_idx, last_origin, last_viewangles, weapon_idx,
+                ammo, origins, opps, aim_state):
+    """Log this frame's AIM geometry vs the nearest opponent: the angular error
+    between the recorder's view and the exact bearing to the enemy, the range,
+    and the enemy's LATERAL speed (velocity component perpendicular to the line
+    of sight).  This is the human ground-truth for calibrating the bot's aim
+    error -- how far a human's aim actually sits off a moving/distant target,
+    per weapon.  Additive to info['aim']; only populated in entities mode, so
+    scan/need/tactics are untouched.  Opponent velocity is differenced from the
+    previous frame the same entity was seen (demos are 10Hz)."""
+    if last_origin is None or last_viewangles is None or not opps:
+        return
+    rx, ry, rz = last_origin[0] / 8.0, last_origin[1] / 8.0, last_origin[2] / 8.0
+    best = None
+    for en in opps:
+        o = origins.get(en)
+        if o is None:
+            continue
+        d = math.hypot(o[0] - rx, o[1] - ry)
+        if best is None or d < best[0]:
+            best = (d, en, o)
+    if best is None:
+        return
+    _, en, o = best
+    ex, ey, ez = rx, ry, rz + 22.0          # recorder eye (viewheight ~22)
+    ox, oy, oz = o[0], o[1], o[2] + 22.0     # opponent center approx
+    dx, dy, dz = ox - ex, oy - ey, oz - ez
+    horiz = math.hypot(dx, dy)
+    rng = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if horiz < 1.0 or rng < 1.0:
+        return
+    bear_yaw = math.degrees(math.atan2(dy, dx))
+    bear_pitch = -math.degrees(math.atan2(dz, horiz))   # Q2: +pitch looks down
+    view_pitch, view_yaw = last_viewangles[0], last_viewangles[1]
+
+    def wrap(a):
+        a %= 360.0
+        return a - 360.0 if a > 180.0 else a
+    err_yaw = wrap(view_yaw - bear_yaw)
+    err_pitch = wrap(view_pitch - bear_pitch)
+
+    # opponent lateral speed: horizontal velocity perpendicular to the LOS
+    lat = -1.0
+    prev = aim_state["prev"].get(en)
+    if prev is not None:
+        pfr, po = prev
+        dt = (frame_idx - pfr) * 0.1
+        if dt > 1e-3:
+            vx = (o[0] - po[0]) / dt
+            vy = (o[1] - po[1]) / dt
+            hx, hy = dx / horiz, dy / horiz          # LOS unit (horizontal)
+            along = vx * hx + vy * hy
+            px, py = vx - along * hx, vy - along * hy
+            lat = math.hypot(px, py)
+    aim_state["prev"][en] = (frame_idx, o)
+    info["aim"].append((frame_idx, weapon_idx, rng, err_yaw, err_pitch, lat, ammo))
+
+
+def _record_engage(info, frame_idx, last_origin, last_velocity, weapon_idx, origins, opps):
+    """Log this frame's engagement geometry vs the nearest opponent: distance and
+    the velocity component toward the enemy (>0 closing, <0 retreating)."""
+    if last_origin is None or not opps:
+        return
+    rx, ry = last_origin[0] / 8.0, last_origin[1] / 8.0
+    best = None
+    for en in opps:
+        o = origins.get(en)
+        if o is None:
+            continue
+        d = math.hypot(o[0] - rx, o[1] - ry)
+        if best is None or d < best[0]:
+            best = (d, o)
+    if best is None:
+        return
+    dist, o = best
+    adv = speed = 0.0
+    if last_velocity is not None:
+        vx, vy = last_velocity[0], last_velocity[1]
+        speed = math.hypot(vx, vy)
+        tx, ty = o[0] - rx, o[1] - ry
+        tl = math.hypot(tx, ty)
+        if tl > 1e-3 and speed > 1e-3:
+            adv = (vx * tx + vy * ty) / tl   # velocity toward enemy, units/sec
+    info["engage"].append((frame_idx, weapon_idx, dist, adv, speed))
+
+
+def parse_combat(data, entities=False):
+    """Decode the recording player's per-frame state + pickups + kills.  With
+    entities=True, also decode the packet-entities section for opponent origins
+    (engagement RANGE / STYLE and kill-range) -- the `tactics` scan; scan/need
+    call with entities=False, which is byte-for-byte the prior behavior."""
     info = {"map": None, "playernum": None, "names": {}, "items": {}, "models": {},
-            "samples": [], "pickups": [], "kills": []}
+            "samples": [], "pickups": [], "kills": [], "engage": [], "killrange": [],
+            "aim": []}
+    aim_state = {"prev": {}}     # opp entnum -> (frame_idx, origin) for velocity
     m = re.search(rb"maps/([A-Za-z0-9_]+)\.bsp", data)
     if m:
         info["map"] = m.group(1).decode()
 
     stats = [0] * 32
-    last_origin = None
+    last_origin = None          # recorder origin, raw s16 (world = /8)
     last_viewangles = None
     last_weapon = None
+    last_velocity = None
+    origins = {}                # entity number -> [x,y,z] world units (entities mode)
     frame_idx = 0
+    # one-frame-behind snapshot: the decision state BEFORE a pickup mutates it
+    # (a health/ammo/weapon pickup bumps STAT_HEALTH/STAT_AMMO on the same frame
+    # the pickup edge fires, so the pickup-frame value is post-pickup-inflated).
+    prev_health = prev_armor = prev_ammo = 0
+    prev_weapon = None
+
+    def opp_entnums():
+        me_ent = (info["playernum"] + 1) if info["playernum"] is not None else -1
+        return [cn + 1 for cn in info["names"] if cn + 1 != me_ent]
 
     for block in iter_blocks(data):
         if not block:
@@ -192,6 +458,20 @@ def parse_combat(data):
                 if obit:
                     victim, attacker, weapon = obit
                     info["kills"].append((frame_idx, victim, attacker, weapon))
+                    # kill-range: recorder's own frags, vs the victim's last-known
+                    # origin (from the previous frame's entities -- the obituary
+                    # print precedes this block's packetentities).  Clean combat
+                    # range signal, no firing gate needed.
+                    if entities and last_origin is not None:
+                        me = info["names"].get(info["playernum"], "")
+                        if me and attacker.lower() == me.lower():
+                            vent = next((cn + 1 for cn, nm in info["names"].items()
+                                         if nm.lower() == victim.lower()), None)
+                            vo = origins.get(vent) if vent is not None else None
+                            if vo is not None:
+                                info["killrange"].append((weapon, math.hypot(
+                                    vo[0] - last_origin[0] / 8.0,
+                                    vo[1] - last_origin[1] / 8.0)))
             elif cmd in (SVC_STUFFTEXT, SVC_CENTERPRINT, SVC_LAYOUT):
                 r.string()
             elif cmd == SVC_INVENTORY:
@@ -202,28 +482,63 @@ def parse_combat(data):
                 size = r.s16()
                 if size >= 0:
                     r.u8(); r.skip(size)
+            elif cmd == SVC_SPAWNBASELINE:
+                if not entities:
+                    break                        # scan/need: skip rest of block (as before)
+                try:
+                    _parse_baseline(r, origins)
+                except (IndexError, ValueError):
+                    break
             elif cmd == SVC_FRAME:
                 r.s32(); r.s32(); r.u8()
                 arealen = r.u8()
                 r.skip(arealen)
                 sub = r.u8()
                 if sub == SVC_PLAYERINFO:
-                    o, va, wi = read_playerinfo(r, stats)
+                    o, va, wi, ve = read_playerinfo(r, stats)
                     if o is not None:
                         last_origin = o
                     if va is not None:
                         last_viewangles = va
                     if wi is not None:
                         last_weapon = wi
+                    if ve is not None:
+                        last_velocity = ve
                     if stats[STAT_PICKUP_STRING]:
                         idx = stats[STAT_PICKUP_STRING] - CS_ITEMS
+                        # log the PRE-pickup snapshot (the state that drove the
+                        # decision to grab it), not the post-pickup inflated stats
                         info["pickups"].append(
-                            (frame_idx, idx, stats[STAT_HEALTH], stats[STAT_ARMOR]))
+                            (frame_idx, idx, prev_health, prev_armor,
+                             prev_ammo, prev_weapon))
                         stats[STAT_PICKUP_STRING] = 0   # one-shot; only log the edge
                     if last_origin is not None and last_viewangles is not None:
                         info["samples"].append(
                             (frame_idx, last_viewangles[0], last_viewangles[1],
-                             last_weapon, stats[STAT_HEALTH], stats[STAT_ARMOR]))
+                             last_weapon, stats[STAT_HEALTH], stats[STAT_ARMOR],
+                             stats[STAT_AMMO]))
+                    if entities:
+                        # this frame's packetentities follow the playerinfo; decode
+                        # opponent origins, then log the engagement geometry.  A
+                        # desync stays contained to this block (fresh Reader next).
+                        try:
+                            if r.u8() == SVC_PACKETENTITIES:
+                                _parse_packetentities(r, origins)
+                                opps = opp_entnums()
+                                _record_engage(info, frame_idx, last_origin,
+                                               last_velocity, last_weapon,
+                                               origins, opps)
+                                _record_aim(info, frame_idx, last_origin,
+                                            last_viewangles, last_weapon,
+                                            stats[STAT_AMMO], origins, opps,
+                                            aim_state)
+                        except (IndexError, ValueError):
+                            pass
+                    # snapshot this frame's state as the "before" for the next frame
+                    prev_health = stats[STAT_HEALTH]
+                    prev_armor = stats[STAT_ARMOR]
+                    prev_ammo = stats[STAT_AMMO]
+                    prev_weapon = last_weapon
                     frame_idx += 1
                 break
             elif cmd in (SVC_DISCONNECT, SVC_RECONNECT):
@@ -288,8 +603,8 @@ def scan(mapname, limit):
 
         samp = info["samples"]
         for i in range(1, len(samp)):
-            f0, y0, p0, w0, h0, a0 = samp[i - 1]
-            f1, y1, p1, w1, h1, a1 = samp[i]
+            f0, y0, p0, w0, h0, a0, am0 = samp[i - 1]
+            f1, y1, p1, w1, h1, a1, am1 = samp[i]
             if f1 != f0 + 1:
                 continue    # dropped/duplicated frame -- don't blend the rate
             dy = abs(((y1 - y0) + 180) % 360 - 180)
@@ -298,13 +613,13 @@ def scan(mapname, limit):
                 continue    # respawn/teleport view snap, not real aim movement
             turn_rates.append(dy + dp)
 
-        for frame_idx, yaw, pitch, weapon_idx, health, armor in samp:
+        for frame_idx, yaw, pitch, weapon_idx, health, armor, ammo in samp:
             w = resolve_weapon(info["models"], weapon_idx)
             if w:
                 equip_time[w] += 1
 
         last_pickup_frame = None
-        for frame_idx, idx, health, armor in info["pickups"]:
+        for frame_idx, idx, health, armor, ammo, weapon_idx in info["pickups"]:
             item = info["items"].get(idx, f"item#{idx}")
             pickup_item_counts[item] += 1
             pickup_health[item].append(health)
@@ -363,6 +678,406 @@ def scan(mapname, limit):
     }
 
 
+def _pctile(xs, p):
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    k = min(int(len(xs) * p), len(xs) - 1)
+    return xs[k]
+
+
+def _summ(xs):
+    return {
+        "n": len(xs),
+        "p10": _pctile(xs, 0.10), "p25": _pctile(xs, 0.25),
+        "p50": _pctile(xs, 0.50), "p75": _pctile(xs, 0.75),
+        "p90": _pctile(xs, 0.90),
+        "mean": round(sum(xs) / len(xs), 1) if xs else 0.0,
+    }
+
+
+def need(mapname, limit):
+    """Mine human resource-need thresholds across the corpus (all maps by
+    default): at what health/armor/ammo did pros decide to grab each item
+    category.  Writes demos/derived/combat_need/thresholds.json."""
+    import datetime
+
+    pickup_state = defaultdict(lambda: defaultdict(list))  # cat -> field -> [vals]
+    ammo_by_type = defaultdict(list)   # ammo type -> [pre_ammo] on a matched top-up
+    ammo_health = []                   # health at any ammo pickup
+    ammo_match = ammo_mismatch = ammo_noweapon = 0
+    wsw = {"n": 0, "switched": 0, "delays": []}
+    wsw_by = defaultdict(lambda: {"n": 0, "switched": 0, "delays": []})
+    equip_time = Counter()
+    kill_weapon_counts = Counter()
+    maps = Counter()
+    demos_ok = demos_bad = 0
+
+    for name, data in iter_zip_demos(mapname, limit):
+        try:
+            info = parse_combat(data)
+        except Exception:
+            demos_bad += 1
+            continue
+        if not info["samples"]:
+            demos_bad += 1
+            continue
+        demos_ok += 1
+        if info["map"]:
+            maps[info["map"]] += 1
+        models = info["models"]
+
+        # weapon held per frame (for weapon-switch detection + equip-time share)
+        frame_weap = {}
+        for s in info["samples"]:
+            fw = resolve_weapon(models, s[3])
+            if fw:
+                frame_weap[s[0]] = fw
+                equip_time[fw] += 1
+
+        for frame_idx, idx, pre_h, pre_a, pre_ammo, pre_widx in info["pickups"]:
+            item = info["items"].get(idx, "")
+            if not item:
+                continue
+            cat = item_category(item)
+            held = resolve_weapon(models, pre_widx)
+            if cat == "health":
+                pickup_state["health"]["health"].append(pre_h)
+                pickup_state["health"]["armor"].append(pre_a)
+            elif cat == "armor":
+                pickup_state["armor"]["armor"].append(pre_a)
+                pickup_state["armor"]["health"].append(pre_h)
+            elif cat == "weapon":
+                pickup_state["weapon"]["health"].append(pre_h)
+                picked = item.lower()      # matches resolve_weapon output
+                wsw["n"] += 1
+                wsw_by[picked]["n"] += 1
+                for d in range(1, 21):     # scan forward up to ~2s (20 frames)
+                    if frame_weap.get(frame_idx + d) == picked:
+                        wsw["switched"] += 1
+                        wsw["delays"].append(d * 100)
+                        wsw_by[picked]["switched"] += 1
+                        wsw_by[picked]["delays"].append(d * 100)
+                        break
+            elif cat == "ammo":
+                ammo_health.append(pre_h)
+                atype = ammo_item_type(item)
+                held_ammo = WEAPON_AMMO.get(held) if held else None
+                # stat 3 is ammo for the CURRENTLY-HELD weapon, so it's only the
+                # right "how low was I" reading when the ammo they grabbed feeds
+                # the gun in their hands -- the deliberate top-up we want to model.
+                if held_ammo is None:
+                    ammo_noweapon += 1
+                elif atype and atype == held_ammo:
+                    ammo_by_type[atype].append(pre_ammo)
+                    ammo_match += 1
+                else:
+                    ammo_mismatch += 1
+
+        me = info["names"].get(info["playernum"], "").lower()
+        for frame_idx, victim, attacker, weapon in info["kills"]:
+            if me and attacker.lower() == me:
+                kill_weapon_counts[weapon] += 1
+
+    total_eq = sum(equip_time.values()) or 1
+    total_kills = sum(kill_weapon_counts.values()) or 1
+
+    out = {
+        "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "corpus": {
+            "demos_parsed": demos_ok, "demos_skipped": demos_bad,
+            "maps": dict(maps.most_common()),
+        },
+        "pickup_need": {
+            "health": {
+                "health_at_pickup": _summ(pickup_state["health"]["health"]),
+                "armor_at_pickup": _summ(pickup_state["health"]["armor"]),
+            },
+            "armor": {
+                "armor_at_pickup": _summ(pickup_state["armor"]["armor"]),
+                "health_at_pickup": _summ(pickup_state["armor"]["health"]),
+            },
+            "ammo": {
+                "health_at_pickup": _summ(ammo_health),
+                "matched_pickups": ammo_match,
+                "mismatched_pickups": ammo_mismatch,
+                "no_owned_weapon_pickups": ammo_noweapon,
+                "by_ammo_type": {t: _summ(v) for t, v in sorted(ammo_by_type.items())},
+            },
+            "weapon": {
+                "health_at_pickup": _summ(pickup_state["weapon"]["health"]),
+            },
+        },
+        "weapon_switch": {
+            "n_weapon_pickups": wsw["n"],
+            "switched_within_2s_pct":
+                round(100.0 * wsw["switched"] / wsw["n"], 1) if wsw["n"] else 0.0,
+            "switch_delay_ms": {"p50": _pctile(wsw["delays"], 0.5),
+                                "p90": _pctile(wsw["delays"], 0.9)},
+            "by_weapon": {
+                w: {"n": d["n"],
+                    "switched_pct":
+                        round(100.0 * d["switched"] / d["n"], 1) if d["n"] else 0.0,
+                    "delay_ms_p50": _pctile(d["delays"], 0.5)}
+                for w, d in sorted(wsw_by.items(), key=lambda kv: -kv[1]["n"])
+            },
+        },
+        "weapon_equipped_pct":
+            {w: round(100.0 * c / total_eq, 1) for w, c in equip_time.most_common()},
+        "weapon_at_kill_pct":
+            {w: round(100.0 * c / total_kills, 1) for w, c in kill_weapon_counts.most_common()},
+        "calibration": {
+            "bot_healthneed": {
+                "urgency_health_p50": _pctile(pickup_state["health"]["health"], 0.5),
+                "note": "median health at which pros top up; urgency curve should already pull by here",
+            },
+            "bot_ammoneed": {
+                "low_threshold_by_ammo":
+                    {t: _pctile(v, 0.5) for t, v in sorted(ammo_by_type.items())},
+                "note": "p50 of ammo-for-held-weapon at the moment they refilled that ammo type",
+            },
+            "bot_wpnneed": {
+                "kill_rank": [w for w, _ in kill_weapon_counts.most_common()],
+            },
+        },
+    }
+
+    outdir = os.path.join(ROOT, "demos", "derived", "combat_need")
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, "thresholds.json")
+    with open(outpath, "w") as f:
+        json.dump(out, f, indent=2)
+
+    # ---- console summary ----
+    print(f"\n=== {mapname or 'ALL MAPS'}: {demos_ok} demos parsed, {demos_bad} skipped ===")
+    print(f"maps: {dict(maps.most_common(8))}{' ...' if len(maps) > 8 else ''}\n")
+
+    def line(tag, s):
+        print(f"  {tag:22s} n={s['n']:7d}  p25={s['p25']:5.0f} p50={s['p50']:5.0f} "
+              f"p75={s['p75']:5.0f}  mean={s['mean']:5.1f}")
+
+    print("-- HEALTH: player state when they picked up a health item --")
+    line("health-at-pickup", _summ(pickup_state["health"]["health"]))
+    line("armor-at-pickup", _summ(pickup_state["health"]["armor"]))
+    print("\n-- ARMOR: player state when they picked up an armor item --")
+    line("armor-at-pickup", _summ(pickup_state["armor"]["armor"]))
+    line("health-at-pickup", _summ(pickup_state["armor"]["health"]))
+    print("\n-- AMMO: ammo-for-held-weapon when refilling THAT ammo type --")
+    print(f"  (matched top-ups={ammo_match}  mismatched={ammo_mismatch}  "
+          f"no-owned-weapon={ammo_noweapon})")
+    for t, v in sorted(ammo_by_type.items()):
+        line(t, _summ(v))
+    line("health-at-ammo-pickup", _summ(ammo_health))
+    print("\n-- WEAPON: switch to a freshly-grabbed gun within 2s --")
+    print(f"  {out['weapon_switch']['switched_within_2s_pct']:.1f}% of "
+          f"{wsw['n']} weapon pickups; delay p50="
+          f"{out['weapon_switch']['switch_delay_ms']['p50']}ms")
+    print("  weapon-at-kill %: " + ", ".join(
+        f"{w} {p}" for w, p in list(out["weapon_at_kill_pct"].items())[:8]))
+    print(f"\n-> wrote {outpath}")
+    return out
+
+
+def tactics(mapname, limit):
+    """Per-weapon engagement RANGE + STYLE from the pro corpus (opponent origins
+    decoded from packet entities).  Writes demos/derived/combat_tactics/
+    weapon_profiles.json -- the calibration source for the bot's weapon-aware
+    combat (preferred-range bands + advance/retreat style)."""
+    import datetime
+    ENGAGE_CAP = 1200.0   # count engage frames only when an opponent is this near (in-fight)
+    ADV_THRESH = 60.0     # |velocity toward enemy| (u/s) to call advance/retreat vs neutral
+
+    krange = defaultdict(list)                 # weapon -> [kill distance]
+    erange = defaultdict(list)                 # weapon -> [engage distance < CAP]
+    espeed = defaultdict(list)                 # weapon -> [speed while engaged]
+    estyle = defaultdict(lambda: [0, 0, 0])    # weapon -> [advance, retreat, neutral]
+    maps = Counter()
+    demos_ok = demos_bad = 0
+
+    for name, data in iter_zip_demos(mapname, limit):
+        try:
+            info = parse_combat(data, entities=True)
+        except Exception:
+            demos_bad += 1
+            continue
+        if not info["samples"]:
+            demos_bad += 1
+            continue
+        demos_ok += 1
+        if info["map"]:
+            maps[info["map"]] += 1
+
+        for weapon, dist in info["killrange"]:
+            if weapon in ("telefrag", "?"):
+                continue
+            krange[weapon].append(dist)
+
+        for frame_idx, widx, dist, adv, speed in info["engage"]:
+            if dist > ENGAGE_CAP:
+                continue
+            w = resolve_weapon(info["models"], widx)
+            if not w:
+                continue
+            erange[w].append(dist)
+            espeed[w].append(speed)
+            s = estyle[w]
+            if adv > ADV_THRESH:
+                s[0] += 1
+            elif adv < -ADV_THRESH:
+                s[1] += 1
+            else:
+                s[2] += 1
+
+    weapons = sorted(set(krange) | set(erange))
+    out = {
+        "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "corpus": {"demos_parsed": demos_ok, "demos_skipped": demos_bad,
+                   "maps": dict(maps.most_common())},
+        "params": {"engage_cap": ENGAGE_CAP, "advance_thresh": ADV_THRESH},
+        "weapons": {}, "calibration": {"bands": {}, "style": {}},
+    }
+    for w in weapons:
+        st = estyle[w]
+        tot = sum(st) or 1
+        adv_f, ret_f, neu_f = (round(st[0] / tot, 3), round(st[1] / tot, 3),
+                               round(st[2] / tot, 3))
+        out["weapons"][w] = {
+            "kill_range": _summ(krange[w]),
+            "engage_range": _summ(erange[w]),
+            "speed": {"p50": _pctile(espeed[w], 0.5), "p90": _pctile(espeed[w], 0.9)},
+            "advance_frac": adv_f, "retreat_frac": ret_f, "neutral_frac": neu_f,
+            "n_style": sum(st),
+        }
+        # bands prefer kill-range (clean combat range); fall back to engage-range if sparse
+        src = _summ(krange[w]) if len(krange[w]) >= 30 else _summ(erange[w])
+        out["calibration"]["bands"][w] = {"lo": src["p25"], "center": src["p50"], "hi": src["p75"]}
+        out["calibration"]["style"][w] = ("press" if adv_f - ret_f > 0.1 else
+                                          "defensive" if ret_f - adv_f > 0.1 else "hold")
+
+    outdir = os.path.join(ROOT, "demos", "derived", "combat_tactics")
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, "weapon_profiles.json")
+    with open(outpath, "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"\n=== {mapname or 'ALL MAPS'}: {demos_ok} demos parsed, {demos_bad} skipped ===")
+    print(f"maps: {dict(maps.most_common(8))}{' ...' if len(maps) > 8 else ''}\n")
+    print(f"{'weapon':16s} {'killR_p50':>9} {'engR_p50':>9} {'band lo/hi':>13}  "
+          f"{'style':9s} adv/ret")
+    for w in sorted(weapons, key=lambda x: -out["weapons"][x]["kill_range"]["n"]):
+        d = out["weapons"][w]
+        b = out["calibration"]["bands"][w]
+        print(f"{w:16s} {d['kill_range']['p50']:9.0f} {d['engage_range']['p50']:9.0f} "
+              f"{b['lo']:5.0f}/{b['hi']:<6.0f} {out['calibration']['style'][w]:9s} "
+              f"{d['advance_frac']:.2f}/{d['retreat_frac']:.2f}  (killN={d['kill_range']['n']})")
+    print(f"\n-> wrote {outpath}")
+    return out
+
+
+def aim(mapname, limit):
+    """Human aim-error ground truth (calibration for the bot's Combat_Aim error).
+    For every engaged frame (holding a weapon, an opponent present, view within
+    ~45deg of the enemy) measure |view - exact-bearing| yaw error, bucketed by
+    weapon x range x opponent-lateral-speed.  Also isolates RAILGUN FIRE frames
+    (detected by a slug decrement) -- the cleanest 'how far off is a committed
+    shot' signal.  Writes demos/derived/combat_aim/aim_profiles.json."""
+    import datetime
+    WEAPONS = ["railgun", "blaster", "hyperblaster", "chaingun", "machinegun",
+               "super shotgun"]
+    RB = [("near<300", 0, 300), ("mid300-600", 300, 600), ("far>600", 600, 1e9)]
+    ENG_CONE = 45.0     # view within this of the enemy bearing = "engaging"
+    LAT_SPLIT = 150.0   # opponent lateral speed slow/fast boundary (u/s)
+
+    # weapon -> range-bucket -> lat-class(slow/fast/any) -> [abs err_yaw]
+    buckets = {w: {rb[0]: {"slow": [], "fast": [], "any": []} for rb in RB}
+               for w in WEAPONS}
+    fire_err = defaultdict(list)      # weapon -> [abs err_yaw at fire]
+    latpairs = defaultdict(list)      # weapon -> [(lat, abs err_yaw)]
+    demos_ok = demos_bad = 0
+
+    for name, data in iter_zip_demos(mapname, limit):
+        try:
+            info = parse_combat(data, entities=True)
+        except Exception:
+            demos_bad += 1
+            continue
+        if not info["aim"]:
+            demos_bad += 1
+            continue
+        demos_ok += 1
+        prev_rail_ammo = None
+        for (fr, widx, rng, eyaw, epitch, lat, ammo) in info["aim"]:
+            w = resolve_weapon(info["models"], widx)
+            if w not in buckets:
+                # still track railgun-fire even if not in the table set
+                if w != "railgun":
+                    continue
+            aey = abs(eyaw)
+            # railgun fire detection via slug decrement
+            if w == "railgun":
+                if prev_rail_ammo is not None and ammo < prev_rail_ammo \
+                        and aey < 90.0 and rng < 2000:
+                    fire_err["railgun"].append(aey)
+                prev_rail_ammo = ammo
+            if w not in buckets or aey > ENG_CONE or rng > 1600:
+                continue
+            # find range bucket
+            rbname = next((n for (n, lo, hi) in RB if lo <= rng < hi), None)
+            if not rbname:
+                continue
+            slot = buckets[w][rbname]
+            slot["any"].append(aey)
+            if lat >= 0:
+                latpairs[w].append((lat, aey))
+                slot["fast" if lat >= LAT_SPLIT else "slow"].append(aey)
+
+    out = {
+        "generated": datetime.datetime.now(datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "corpus": {"demos_parsed": demos_ok, "demos_skipped": demos_bad},
+        "params": {"engage_cone_deg": ENG_CONE, "lat_split": LAT_SPLIT,
+                   "range_buckets": [r[0] for r in RB]},
+        "note": "err = |view_yaw - exact_bearing_yaw| in degrees; human ground truth",
+        "weapons": {}, "railgun_fire": _summ(fire_err["railgun"]),
+    }
+    for w in WEAPONS:
+        wd = {}
+        for (rbname, _, _) in RB:
+            s = buckets[w][rbname]
+            wd[rbname] = {
+                "n": len(s["any"]),
+                "err_p50": round(_pctile(s["any"], 0.5), 2),
+                "err_p90": round(_pctile(s["any"], 0.9), 2),
+                "slow_p50": round(_pctile(s["slow"], 0.5), 2),
+                "slow_n": len(s["slow"]),
+                "fast_p50": round(_pctile(s["fast"], 0.5), 2),
+                "fast_n": len(s["fast"]),
+            }
+        out["weapons"][w] = wd
+
+    outdir = os.path.join(ROOT, "demos", "derived", "combat_aim")
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, "aim_profiles.json")
+    with open(outpath, "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"\n=== {mapname or 'ALL MAPS'}: {demos_ok} demos parsed, "
+          f"{demos_bad} skipped -- HUMAN aim-error (deg) ===")
+    print(f"railgun FIRE-frame |err_yaw|: {_summ(fire_err['railgun'])}\n")
+    print(f"{'weapon':14s} {'range':11s} {'n':>6} {'|err|p50':>9} {'p90':>7}  "
+          f"{'slow_p50':>8}(n) {'fast_p50':>8}(n)")
+    for w in WEAPONS:
+        for (rbname, _, _) in RB:
+            d = out["weapons"][w][rbname]
+            if d["n"] < 20:
+                continue
+            print(f"{w:14s} {rbname:11s} {d['n']:6d} {d['err_p50']:9.2f} "
+                  f"{d['err_p90']:7.2f}  {d['slow_p50']:8.2f}({d['slow_n']:>5}) "
+                  f"{d['fast_p50']:8.2f}({d['fast_n']:>5})")
+    print(f"\n-> wrote {outpath}")
+    return out
+
+
 def one(path):
     data = open(path, "rb").read()
     info = parse_combat(data)
@@ -372,7 +1087,10 @@ def one(path):
     print("items seen:", {k: v for k, v in list(info["items"].items())[:10]})
     for p in info["pickups"][:10]:
         idx = p[1]
-        print("pickup:", info["items"].get(idx, f"#{idx}"), "health=", p[2], "armor=", p[3])
+        w = resolve_weapon(info["models"], p[5])
+        print("pickup:", info["items"].get(idx, f"#{idx}"),
+              "pre_health=", p[2], "pre_armor=", p[3], "pre_ammo=", p[4],
+              "holding=", w)
     for k in info["kills"][:10]:
         print("kill:", k)
     weapons = Counter()
@@ -381,6 +1099,152 @@ def one(path):
         if w:
             weapons[w] += 1
     print("weapon-equipped samples:", weapons.most_common())
+
+
+def timing(mapname, limit):
+    """Item-timing / respawn-cycle analysis.  For the POV pro in each demo, the
+    interval between successive pickups of the SAME major timed item (Mega Health,
+    the armors, power-ups) is bounded below by that item's respawn time -- so the
+    interval distribution reveals BOTH the effective respawn cadence (its lower
+    tail) and how disciplined the pro's re-timing is (how tightly intervals cluster
+    at that floor).  STAT_PICKUP_STRING is the POV player's own HUD notify, so this
+    is exactly the pro whose timing we want to model.  Writes
+    demos/derived/combat_timing/timing.json.  This is an ANALYSIS artifact -- no
+    bot lever is calibrated from it yet; it quantifies how much predictive
+    item-timing pros actually do, per item and per (duel) map, so the value of a
+    predictive pre-positioning behavior can be judged before it is built."""
+    import datetime
+
+    # major timed items worth pre-positioning for (substring match on pickup name)
+    TIMED = ["Mega Health", "Body Armor", "Combat Armor", "Jacket Armor",
+             "Quad Damage", "Invulnerability", "Power Shield", "Power Screen"]
+
+    def timed_name(item):
+        low = item.lower()
+        for t in TIMED:
+            if t.lower() in low:
+                return t
+        return None
+
+    intervals = defaultdict(list)                      # item -> [dt seconds]
+    per_map = defaultdict(lambda: defaultdict(list))   # map -> item -> [dt]
+    demos_with_repeat = defaultdict(int)               # item -> #demos with >=2
+    pickups_total = defaultdict(int)                   # item -> total POV pickups
+    demos_seen_item = defaultdict(int)                 # item -> #demos with >=1
+    demos_ok = demos_bad = 0
+    maps = Counter()
+
+    for name, data in iter_zip_demos(mapname, limit):
+        try:
+            info = parse_combat(data)
+        except Exception:
+            demos_bad += 1
+            continue
+        if not info["pickups"]:
+            demos_bad += 1
+            continue
+        demos_ok += 1
+        mp = info["map"] or "?"
+        maps[mp] += 1
+        seq = defaultdict(list)   # item -> [frame_idx]
+        for frame_idx, idx, ph, pa, pam, pw in info["pickups"]:
+            tn = timed_name(info["items"].get(idx, ""))
+            if tn:
+                seq[tn].append(frame_idx)
+        for tn, frames in seq.items():
+            frames.sort()
+            pickups_total[tn] += len(frames)
+            demos_seen_item[tn] += 1
+            if len(frames) >= 2:
+                demos_with_repeat[tn] += 1
+            for a, b in zip(frames, frames[1:]):
+                dt = (b - a) * 0.1   # 10Hz demo frames -> seconds
+                if 0 < dt < 600:     # drop absurd gaps (level changes, parse holes)
+                    intervals[tn].append(dt)
+                    per_map[mp][tn].append(dt)
+
+    def tightness(xs):
+        """Fraction of intervals within 1.35x the p10 'respawn floor' -- high means
+        the pro re-grabs close to when the item comes back (deliberate timing)."""
+        if len(xs) < 8:
+            return None
+        floor = _pctile(xs, 0.10)
+        if floor <= 0:
+            return None
+        near = sum(1 for v in xs if v <= floor * 1.35)
+        return round(near / len(xs), 3)
+
+    items_out = {}
+    for tn in TIMED:
+        iv = intervals.get(tn, [])
+        items_out[tn] = {
+            "pov_pickups": pickups_total.get(tn, 0),
+            "demos_with_item": demos_seen_item.get(tn, 0),
+            "demos_with_repeat": demos_with_repeat.get(tn, 0),
+            "repeat_demo_pct": round(100.0 * demos_with_repeat.get(tn, 0)
+                                     / max(1, demos_seen_item.get(tn, 0)), 1),
+            "interval_s": _summ(iv) if iv else None,
+            "respawn_floor_s": round(_pctile(iv, 0.10), 1) if iv else None,
+            "timing_tightness": tightness(iv),
+        }
+
+    # per-map cadence for the maps with the most timed-item intervals (duel maps)
+    map_rank = sorted(per_map.keys(),
+                      key=lambda m: -sum(len(v) for v in per_map[m].values()))
+    maps_out = {}
+    for mp in map_rank[:8]:
+        entry = {}
+        for tn, iv in per_map[mp].items():
+            if len(iv) >= 8:
+                entry[tn] = {
+                    "n": len(iv),
+                    "floor_s": round(_pctile(iv, 0.10), 1),
+                    "p50_s": round(_pctile(iv, 0.50), 1),
+                    "tightness": tightness(iv),
+                }
+        if entry:
+            maps_out[mp] = entry
+
+    out = {
+        "generated": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "corpus": {"demos_parsed": demos_ok, "demos_skipped": demos_bad,
+                   "maps": dict(maps.most_common())},
+        "method": ("interval between successive POV pickups of the same timed item; "
+                   "floor=p10~respawn, tightness=frac within 1.35x floor"),
+        "items": items_out,
+        "by_map": maps_out,
+    }
+
+    outdir = os.path.join(ROOT, "demos", "derived", "combat_timing")
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, "timing.json")
+    with open(outpath, "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"\n=== {mapname or 'ALL MAPS'} item-timing: {demos_ok} demos, "
+          f"{demos_bad} skipped ===")
+    print(f"maps: {dict(maps.most_common(6))}{' ...' if len(maps) > 6 else ''}\n")
+    print(f"  {'item':16s} {'povPick':>7s} {'rptDemo%':>8s} {'floor_s':>7s} "
+          f"{'p50_s':>6s} {'tight':>6s}")
+    for tn in TIMED:
+        e = items_out[tn]
+        iv = e["interval_s"]
+        if not iv:
+            print(f"  {tn:16s} {e['pov_pickups']:7d} {'-':>8s} {'-':>7s} "
+                  f"{'-':>6s} {'-':>6s}   (no repeat intervals)")
+            continue
+        print(f"  {tn:16s} {e['pov_pickups']:7d} {e['repeat_demo_pct']:8.1f} "
+              f"{e['respawn_floor_s']:7.1f} {iv['p50']:6.0f} "
+              f"{(e['timing_tightness'] if e['timing_tightness'] is not None else 0):6.2f}")
+    print("\n  per-map floor/p50/tightness (top duel maps):")
+    for mp, entry in list(maps_out.items())[:6]:
+        parts = [f"{tn.split()[0]}:{d['floor_s']:.0f}/{d['p50_s']:.0f}/"
+                 f"{(d['tightness'] if d['tightness'] is not None else 0):.2f}"
+                 for tn, d in entry.items()]
+        print(f"    {mp:10s} " + "  ".join(parts))
+    print(f"\n-> wrote {outpath}")
+    return out
 
 
 if __name__ == "__main__":
@@ -397,4 +1261,13 @@ if __name__ == "__main__":
         for a in rest:
             if a.startswith("--limit"):
                 limit = int(a.split("=", 1)[1]) if "=" in a else int(rest[rest.index(a) + 1])
-        result = scan(mapname, limit)
+        if cmd == "need":
+            result = need(mapname, limit)
+        elif cmd == "timing":
+            result = timing(mapname, limit)
+        elif cmd == "tactics":
+            result = tactics(mapname, limit)
+        elif cmd == "aim":
+            result = aim(mapname, limit)
+        else:
+            result = scan(mapname, limit)

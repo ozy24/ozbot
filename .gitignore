@@ -47,3 +47,9 @@ desktop.ini
 __pycache__/
 *.pyc
 
+
+# In-repo runtime, corpus, and engine/reference sources (unversioned here)
+/engine/
+/demos/
+/q2pro/
+/quake2-source/
