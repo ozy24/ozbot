@@ -185,12 +185,18 @@ by synthesizing a `usercmd_t` and calling `ClientThink`. Bots are fully visible 
 - `analyze.py` — the main telemetry analyzer; also writes a top-down coverage/failure heatmap PNG.
 - `benchmark.py` — cross-map stats tracker. Runs the standard fastsim rig on every q2dm map from a
   **pinned** nav baseline (`baselines/nav/<map>.nav`) with a fixed seed, so two snapshots differ
-  only because the *code* changed. Extracts the headline metrics (ITEM completion, pickups, frags,
-  deaths, K/D, nav nodes) per map, appends a dated snapshot (commit + `--note`) to
-  `baselines/benchmark_history.jsonl`, and regenerates the human-facing `STATS.md`. Freezes the
-  built DLL + pinned navs into `engine/ozbot_bench`, so a live `play.bat` can't perturb a run.
-  `py tools/benchmark.py --note "<what changed>"` (all 8 maps, ~30s wall); `--maps q2dm1,q2dm5`
-  to subset; `--report-only` to regenerate `STATS.md` from history. The baseline is **normalized**:
+  only because the *code* changed. Runs each map under **two rigs**: **solo** (1 bot, combat
+  impossible) is the nav-quality **headline** — it isolates last-leg item-collection with no combat
+  interruption / respawn-teleport / contention — and **deathmatch** (5 bots) is the integration
+  metric (combat + contention, where wins like `bot_claim` show up; collection reads ~half the solo
+  number because combat interrupts routes). Extracts per-variant metrics (collection %, pickups,
+  attempts, plus frags/deaths/K/D for deathmatch, nav nodes), appends a *variant-nested* snapshot
+  (commit + `--note`) to `baselines/benchmark_history.jsonl`, and regenerates the human-facing
+  `STATS.md` (solo table/trend on top). Freezes the built DLL + pinned navs into `engine/ozbot_bench`,
+  so a live `play.bat` can't perturb a run. `py tools/benchmark.py --note "<what changed>"` (all 8
+  maps × 2 rigs, ~30s wall); `--maps q2dm1,q2dm5` to subset; `--no-solo` / `--no-dm` to run one rig;
+  `--report-only` to regenerate `STATS.md` from history. (Solo runs 1 bot vs deathmatch's 5, so it
+  yields ~5× fewer attempts per run — bump `--instances`/`--seconds` for tight nav A/Bs.) The baseline is **normalized**:
   `--mature` regrows every map's graph from COLD with one identical rig (11 bots × 720s game, fixed
   seed) into `baselines/nav/` + `engine/ozbot/nav/`, so no map is advantaged by a longer-lived
   hand-curated graph — rerun it if the locomotion/nav-learning code changes. (`--pin` instead
@@ -243,8 +249,12 @@ by synthesizing a `usercmd_t` and calling `ClientThink`. Bots are fully visible 
   that this 10Hz bot can't reach — the reason it was long assumed absent; see the
   `ozbot-q2dm1-items` memory). Don't tune item logic around items the map lacks (verify a map's
   actual BSP entity lump first — `engine/baseq2/pak1.pak → maps/q2dm1.bsp`).
-- Goal-success metrics are noisy per-run; measure over longer/aggregated runs. "ITEM completion"
-  (`pickups / item-goal-attempts`) is the meaningful navigation-quality number.
+- Goal-success metrics are noisy per-run; measure over longer/aggregated runs. The clean
+  navigation-quality number is **solo nav-collection %** — 1-bot, combat-free
+  `pickups / item-goal-attempts`, which isolates last-leg execution. The 5-bot **deathmatch ITEM%**
+  runs systematically lower (combat interrupts routes — ~halved on q2dm1) and is the *integration*
+  metric, not a nav read. Both are tracked in `STATS.md`; solo can even reveal nav problems that
+  deathmatch's respawn-scatter masks (q2dm6).
 - When chaining `cmd /c <bat>` with PowerShell `Remove-Item` in one command, a sandbox guard can
   misfire — run the build/deploy and the file cleanup as separate commands.
 - `README.md` is a real, human-facing project README (rewritten 2026-07-02; keep it in sync when
