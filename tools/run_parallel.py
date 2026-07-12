@@ -43,9 +43,8 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))   # <repo>/tools
-REPO = os.path.dirname(HERE)                         # the bot repo
-ROOT = os.path.dirname(REPO)                         # umbrella root (holds engine/, demos/)
-DEFAULT_ENGINE = os.path.join(ROOT, "engine")
+REPO = os.path.dirname(HERE)                         # the bot repo (holds engine/, demos/)
+DEFAULT_ENGINE = os.path.join(REPO, "engine")
 BOT_ID_STRIDE = 1000   # worker i's bot b -> id i*STRIDE + b (keeps ids distinct)
 
 

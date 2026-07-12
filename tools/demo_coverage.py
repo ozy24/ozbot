@@ -19,7 +19,7 @@ import zlib
 
 import dm2parse
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DEFAULT = os.path.join(ROOT, "demos", "raw")
 NAV_DEFAULT = os.path.join(ROOT, "engine", "ozbot", "nav", "q2dm1.nav")
 

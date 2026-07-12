@@ -21,7 +21,7 @@ import time
 import urllib.request
 
 BASE = "https://demos.q2players.org"
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "demos")
 RAW = os.path.join(OUT, "raw")
 URLS = os.path.join(OUT, "urls.txt")

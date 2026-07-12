@@ -6,7 +6,7 @@ REM   Use  = toggle eyecam / third-person while chasing
 REM   bot_debug 1  = draw nav paths and combat debug beams
 REM Override the install location with:  set Q2DIR=C:\path\to\quake2
 setlocal
-if "%Q2DIR%"=="" set "Q2DIR=%~dp0..\engine"
+if "%Q2DIR%"=="" set "Q2DIR=%~dp0engine"
 cd /d "%Q2DIR%"
 
 if not exist "ozbot\gamex86.dll" (

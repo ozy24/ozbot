@@ -10,9 +10,9 @@ REM
 REM Needs: VS2022 C++ workload, and meson+ninja (py -m pip install --user meson ninja).
 REM Override the install location with:  set Q2DIR=C:\path\to\quake2
 setlocal enabledelayedexpansion
-cd /d "%~dp0..\q2pro"
+cd /d "%~dp0q2pro"
 
-if "%Q2DIR%"=="" set "Q2DIR=%~dp0..\engine"
+if "%Q2DIR%"=="" set "Q2DIR=%~dp0engine"
 
 REM --- meson/ninja live in the pip user scripts dir; put it on PATH ---
 for /f "usebackq tokens=*" %%i in (`py -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"`) do set "PYSCRIPTS=%%i"

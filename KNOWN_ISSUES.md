@@ -2,7 +2,7 @@
 
 Honest list of what the bot currently cannot do, with the evidence behind each item.
 Most of these are *measured* limitations with failed fix attempts documented in
-`../PLAN.md` — read that (and the A/B protocol in `README.md`) before re-attempting one.
+`PLAN.md` — read that (and the A/B protocol in `README.md`) before re-attempting one.
 
 ## Navigation / traversal
 
@@ -13,7 +13,7 @@ controller, taking q2dm1's Grenade Launcher from ~5% to ~41% and the Chaingun fr
 ~55% completion. Two capability wins now share the same shape: `bot_swim` (Railgun, Phase
 15) and `bot_lift` (GL/CG, Phase 17), both from instrumented diagnosis of one named
 failure rather than generic movement work. History of the failed attempts (ledge-jump,
-two steering-only lift fixes, rollout ascent, demo-route surgery) is in `../PLAN.md`
+two steering-only lift fixes, rollout ascent, demo-route surgery) is in `PLAN.md`
 Phases 6–16.
 
 What remains vertically-gated:
@@ -132,9 +132,9 @@ The humanization stack closed most of the measured bot-vs-human distribution gap
   autosave tags into it. For strict A/Bs against pre-Phase-17 baselines, restore a
   `q2dm1.nav.*` backup first.
 - `CHANGELOG.md` and `src/README.md` are stale Quake-2-mod-template boilerplate predating
-  the bot. The living docs are `README.md`, this file, `../PLAN.md`, and the analysis
-  tooling in `../tools/` (note: `../PLAN.md` and `../tools/` live outside this git repo).
-- The demo-archive downloader (`../tools/fetch_demos.py`) disables TLS verification because
+  the bot. The living docs are `README.md`, this file, `PLAN.md`, and the analysis
+  tooling in `tools/` (note: `PLAN.md` and `tools/` live outside this git repo).
+- The demo-archive downloader (`tools/fetch_demos.py`) disables TLS verification because
   the archive site's certificate is expired.
 - Real spectator/player interaction has known-fixed gotchas (slot collisions, respawn edge
-  cases) — see the memory notes referenced in `../PLAN.md` if a new one appears.
+  cases) — see the memory notes referenced in `PLAN.md` if a new one appears.

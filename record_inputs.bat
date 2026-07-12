@@ -13,7 +13,7 @@ REM Then analyze with:  py tools\input_view.py <newest ozbot\logs\q2dm1_*.jsonl>
 REM
 REM Override the install location with:  set Q2DIR=C:\path\to\quake2
 setlocal
-if "%Q2DIR%"=="" set "Q2DIR=%~dp0..\engine"
+if "%Q2DIR%"=="" set "Q2DIR=%~dp0engine"
 cd /d "%Q2DIR%"
 
 if not exist "ozbot\gamex86.dll" (

@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dm2parse
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEMOS = os.path.join(REPO, "demos")
 RAW = os.path.join(DEMOS, "raw")
 SORTED = os.path.join(DEMOS, "sorted")

@@ -1,9 +1,9 @@
 # CLAUDE.md — ozbot (10Hz / x86, q2pro rig)
 
 This file provides guidance to Claude Code (claude.ai/code) when working in this repository.
-This is the **original** ozbot bot. Its 40Hz/x64 sibling lives in `../ozbot-re` (own CLAUDE.md),
-and the **shared runtime + corpus + engine sources** are documented in the umbrella `../CLAUDE.md`
-— read that once per session for the cross-repo layout, revert hygiene, and shared-infra rules.
+This is the **original** ozbot bot. It is a fully self-contained folder: the runtime (`engine/`),
+the pro-demo corpus (`demos/`), and the engine source (`q2pro/`) all live inside this directory.
+Its 40Hz/x64 sibling is a separate self-contained folder at `../ozbot-re` (own CLAUDE.md).
 
 ## What this is
 
@@ -15,16 +15,16 @@ The design, phase history, and key findings live in `PLAN.md` (this repo), in `p
 design docs + measured results: `completed/`, `in progress/` — code comments reference them by
 path), and in the persistent memory at
 `C:\Users\chris\.claude\projects\E--code-projects-ozbot\memory\` — read those first; they contain
-non-obvious decisions and dead-ends already explored. `../CLAUDE_CODE_BEST_PRACTICES.md` has
+non-obvious decisions and dead-ends already explored. `CLAUDE_CODE_BEST_PRACTICES.md` has
 process guidance for working in this tree — token-efficiency habits (never read raw
 telemetry/`.nav` binaries), model-selection tiers, and the git/process safety rules from recorded
 incidents; read it once per session too.
 
-**Version control scope:** this `ozbot/` directory is the git repository and now includes its own
-`tools/` (analysis + sim tooling). The **shared, unversioned** surface lives at the umbrella root:
-`../engine/` (runtime), `../demos/` (corpus), `../q2pro/`, `../quake2-source/`, and the root
-process docs. Mind the revert-hygiene memory: diff before overwriting anything outside a git repo,
-since there is no safety net there.
+**Version control scope:** this directory is the git repository, covering `src/`, `tools/`
+(analysis + sim tooling), `plans/`, `baselines/`, and the docs. The large **unversioned** infra
+lives in-repo but is gitignored: `engine/` (runtime), `demos/` (corpus), `q2pro/` (fastsim
+source), and `quake2-source/` (reference). Mind the revert-hygiene memory: diff before overwriting
+anything in those unversioned dirs — there is no git safety net for them.
 
 ## Hard constraint: 32-bit
 
@@ -39,13 +39,13 @@ silently won't load it. Verify a built DLL's PE machine is `0x14c` if in doubt.
 - `dist/gamex86.dll` — build output. `build.bat` / `deploy.bat` / `run_server.bat` / `play.bat`.
 - `tools/` — Python (stdlib only) analysis & demo tooling (see below).
 - `plans/` — per-arc design docs + measured results. `baselines/` — pinned matured `q2dm1.nav`.
-- Shared at the umbrella root (see `../CLAUDE.md`): `../engine/` (32-bit q2pro runtime —
+- In-repo unversioned infra (gitignored): `engine/` (32-bit q2pro runtime —
   `q2pro.exe` + the fastsim server `q2proded_fast.exe` + `baseq2` paks + the `ozbot/` gamedir where
-  the DLL deploys and `nav/`, `logs/` are written), `../demos/`, `../q2pro/` (fastsim source).
+  the DLL deploys and `nav/`, `logs/` are written), `demos/` (corpus), `q2pro/` (fastsim source).
 
 ## Build / deploy / run
 
-All commands run from this `ozbot/` dir (Windows). `%Q2DIR%` defaults to `..\engine`.
+All commands run from this repo's root (Windows). `%Q2DIR%` defaults to the in-repo `engine`.
 
 ```bat
 build.bat          :: compile src/*.c -> dist/gamex86.dll (x86, MSVC)
@@ -55,10 +55,10 @@ play.bat           :: launch a listen server you can play IN against bots
                    ::   (as a spectator you can chase-cam bots; Use toggles first-person
                    ::    eyecam on the chased bot -- the way to *watch* bot behavior live)
 record_inputs.bat  :: play q2dm1 with bot_inputlog on + a synced demo, to capture YOUR inputs
-build_engine.bat   :: build ../q2pro -> %Q2DIR%/q2proded_fast.exe (the fastsim engine; rarely needed)
+build_engine.bat   :: build q2pro -> %Q2DIR%/q2proded_fast.exe (the fastsim engine; rarely needed)
 ```
 
-Headless sim (what's used for iteration/measurement), run from `../engine/`:
+Headless sim (what's used for iteration/measurement), run from `engine/`:
 ```
 q2pro.exe +set dedicated 1 +set game ozbot +set deathmatch 1 +set maxclients 16 \
           +set bot_count 5 +set bot_skill 0.5 +map q2dm1
@@ -66,7 +66,7 @@ q2pro.exe +set dedicated 1 +set game ozbot +set deathmatch 1 +set maxclients 16 
 
 **There is no unit-test suite.** The bot is validated empirically by the loop:
 **build → deploy → run a timed sim → analyze the telemetry.** Telemetry JSONL is written to
-`../engine/ozbot/logs/q2dm1_<timestamp>.jsonl`; analyze it with:
+`engine/ozbot/logs/q2dm1_<timestamp>.jsonl`; analyze it with:
 ```
 py tools/analyze.py <logfile.jsonl>      # per-bot stats, ITEM completion, failure hotspots, heatmap PNG
 ```
@@ -74,7 +74,7 @@ py tools/analyze.py <logfile.jsonl>      # per-bot stats, ITEM completion, failu
 **Parallel sim harness + fastsim engine — the standard way to iterate/measure.**
 `run_parallel.bat` does build → deploy → N parallel headless sims → merged analyze; it forwards all
 args to `tools/run_parallel.py`. **Always pass `--fastsim`**: it runs the patched
-`../engine/q2proded_fast.exe`, whose `fastsim` cvar makes the dedicated loop skip its per-tick sleep
+`engine/q2proded_fast.exe`, whose `fastsim` cvar makes the dedicated loop skip its per-tick sleep
 and inject one game tick per iteration → CPU-bound sim at **~400× realtime** (the standard
 8×90s rig completes in ~3 wall-seconds; the stock engine caps at ~2× no matter the timescale,
 because `SV_Frame` runs one game frame per loop iteration). Fastsim is bit-exact — same seed
@@ -86,7 +86,7 @@ run_parallel.bat --fastsim --instances 8 --seconds 60 --seed 200 --cvar bot_ledg
 With `--fastsim`, `--seconds` means **game seconds**: each server quits itself via the DLL's
 `bot_quitafter` cvar (saving its nav first), so every seed simulates the same game time no matter
 the CPU load; without `--fastsim` it is wall-clock and servers are killed. Each instance gets an
-isolated worker gamedir (`../engine/ozbot_wN`, seeded with the deployed DLL + a copy of `<map>.nav`)
+isolated worker gamedir (`engine/ozbot_wN`, seeded with the deployed DLL + a copy of `<map>.nav`)
 and its own `net_port`; logs are merged with a per-instance bot-id offset.
 **Pass `--seed` for reproducible A/B measurements** (worker *i* gets `seed+i`); omit it for
 independent pid-seeded samples. `--cvar NAME VALUE` (repeatable) passes any cvar through to every
@@ -129,7 +129,7 @@ each matching item's reachability verdict + what capability gates it).
 A `.dm2` demo records position + view angles but **not** the raw inputs. With `bot_inputlog 1`, the
 DLL (`Bot_LogInput` in `bot_log.c`, called from `ClientThink`, gated on `!Bot_IsClient`) writes one
 `{"type":"input",...}` JSONL record per frame for each **real** player to the normal telemetry log
-(`../engine/ozbot/logs/<map>_<ts>.jsonl`): forward/side/up move, jump (`up>0`), attack, per-frame
+(`engine/ozbot/logs/<map>_<ts>.jsonl`): forward/side/up move, jump (`up>0`), attack, per-frame
 view yaw/pitch, origin, velocity, speed, onground, waterlevel. **`record_inputs.bat`** launches a
 q2dm1 listen server with this on plus a synchronized demo (play, do the move, `quit` to flush the
 demo). Analyse with **`py tools/input_view.py <log.jsonl> [slot]`** — it segments the trace into
@@ -168,7 +168,7 @@ by synthesizing a `usercmd_t` and calling `ClientThink`. Bots are fully visible 
 - Nodes are dropped where bots stand; links are recorded only between nodes a bot actually
   traversed (so links are bot-traversable by construction). `Nav_PenalizeLink` prunes links bots
   keep failing on. A* (`Nav_FindPath`) + the follower in `bot_move.c` execute paths.
-- The graph is saved per-map to `../engine/ozbot/nav/<map>.nav` (binary), autosaved every ~30s, and
+- The graph is saved per-map to `engine/ozbot/nav/<map>.nav` (binary), autosaved every ~30s, and
   **matures across runs** — quality improves the more the bots play. To mature a fresh map, just
   run many bots on it for a while.
 - The `.nav` binary format (if a tool needs to read/write it — see `tools/demo_to_nav.py`):
@@ -180,8 +180,8 @@ by synthesizing a `usercmd_t` and calling `ClientThink`. Bots are fully visible 
 
 ## Python tooling (`tools/`, stdlib only — now versioned in this repo)
 
-- `run_parallel.py` — the parallel-sim harness (behind `run_parallel.bat`). Resolves the shared
-  `../engine` via a triple-dirname umbrella-root walk from `tools/`.
+- `run_parallel.py` — the parallel-sim harness (behind `run_parallel.bat`). Resolves the in-repo
+  `engine/` from `tools/` (repo root = one dir above `tools/`); override with `--engine`.
 - `analyze.py` — the main telemetry analyzer; also writes a top-down coverage/failure heatmap PNG.
 - `dm2parse.py` — protocol-34 `.dm2` demo parser → recording player's trajectory + map + names.
   Works by reading each length-prefixed block only up to `svc_frame`'s playerinfo, then skipping to
@@ -206,19 +206,19 @@ by synthesizing a `usercmd_t` and calling `ClientThink`. Bots are fully visible 
   (kept from the lift work; wholesale demo import remains rejected).
 - `nav_transplant_costs.py` — transplant learned link costs between .nav graphs (from the
   reverted A2 link-times experiment).
-- `extract_demos.py` — unpack `../demos/raw/*.zip` into `../demos/sorted/<map>/` with a resumable
-  JSONL manifest; never modifies `../demos/raw/`. **ozbot is the single writer of the shared
-  `../demos` corpus** (fetch/extract live here only; ozbot-re consumes it read-only).
+- `extract_demos.py` — unpack `demos/raw/*.zip` into `demos/sorted/<map>/` with a resumable
+  JSONL manifest; never modifies `demos/raw/`. `fetch_demos.py` + `extract_demos.py` are the only
+  writers of this repo's `demos/` corpus (ozbot-re now carries its own independent copy).
 - `demo_to_nav.py` — builds a `.nav` from demos. **Note:** importing pro demos as a nav graph was
   tested and makes the bot *worse* (movement mismatch — the bot can't reproduce pro jumps/momentum);
   kept for reference. See the `ozbot-demo-import-finding` memory.
 - `fetch_demos.py` — resumable downloader for the demo archive (the site's TLS cert is expired, so
-  it disables verification). Writes into `../demos`.
+  it disables verification). Writes into `demos`.
 
 ## Gotchas worth knowing
 
 - **A server in the canonical gamedir invalidates same-seed comparisons.** Any q2dm1 session
-  running with `game ozbot` (e.g. play.bat while an agent works) autosaves `../engine/ozbot/nav/q2dm1.nav`,
+  running with `game ozbot` (e.g. play.bat while an agent works) autosaves `engine/ozbot/nav/q2dm1.nav`,
   and every A/B or bit-exact gate seeds workers from that file. If the canonical dir may be live,
   pin the rig: copy the DLL + nav snapshot into a scratch source gamedir and pass
   `run_parallel --mod <dir>` (this happened 2026-07-03 and cost a debugging detour).
@@ -227,7 +227,7 @@ by synthesizing a `usercmd_t` and calling `ClientThink`. Bots are fully visible 
   DOES have a **Megahealth** (`item_health_mega` @ `480 1376 912`, on a trick-jump ledge ~120u up
   that this 10Hz bot can't reach — the reason it was long assumed absent; see the
   `ozbot-q2dm1-items` memory). Don't tune item logic around items the map lacks (verify a map's
-  actual BSP entity lump first — `../engine/baseq2/pak1.pak → maps/q2dm1.bsp`).
+  actual BSP entity lump first — `engine/baseq2/pak1.pak → maps/q2dm1.bsp`).
 - Goal-success metrics are noisy per-run; measure over longer/aggregated runs. "ITEM completion"
   (`pickups / item-goal-attempts`) is the meaningful navigation-quality number.
 - When chaining `cmd /c <bat>` with PowerShell `Remove-Item` in one command, a sandbox guard can

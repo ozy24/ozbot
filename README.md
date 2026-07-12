@@ -151,12 +151,12 @@ deploy.bat         :: copy dist/gamex86.dll -> %Q2DIR%/ozbot/
 run_server.bat     :: build + deploy + launch a dedicated server with bots
 play.bat           :: launch a listen server you can play IN against the bots
 run_parallel.bat   :: build + deploy + N parallel headless sims + merged analysis
-build_engine.bat   :: build ../q2pro (x86, meson) -> %Q2DIR%/q2proded_fast.exe (fastsim engine)
+build_engine.bat   :: build q2pro (x86, meson) -> %Q2DIR%/q2proded_fast.exe (fastsim engine)
 ```
 
 `%Q2DIR%` points at a Quake II install (a q2pro engine dir with `baseq2` paks). The build is
 self-contained: the vanilla Quake II v3.19 headers sit alongside the bot code in `src/` (id's GPL
-release is mirrored at `../quake2-source` for reference only, not as a build input). The analysis
+release is mirrored at `quake2-source` for reference only, not as a build input). The analysis
 tooling (`analyze.py`, `run_parallel.py`, demo parsers — pure Python stdlib) lives in this repo's
 own `tools/`.
 

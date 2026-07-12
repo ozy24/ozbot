@@ -36,7 +36,7 @@ CONSERV_DIST = 128.0    # drop momentum strides longer than this
 CONSERV_UP = 40.0       # drop links that climb more than this (likely jumps)
 WALK, FALL, JUMP, TELEPORT, WATER = 0, 1, 2, 3, 4
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DEFAULT = os.path.join(ROOT, "demos", "raw")
 
 
