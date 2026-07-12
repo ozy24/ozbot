@@ -60,7 +60,6 @@ commit `cebe166`  ⚠️ working tree dirty · rig: 8×90.0s game, solo 1 bot / 
 | Date | Note | q2dm1 | q2dm2 | q2dm3 | q2dm4 | q2dm5 | q2dm6 | q2dm7 | q2dm8 | mean |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 2026-07-12 | normalized baseline: all 8 maps cold-... | — | — | — | — | — | — | — | — | — |
-| 2026-07-12 | bot_aimprec default ON: demo-calibrat... | — | — | — | — | — | — | — | — | — |
 | 2026-07-12 | dual metric: solo nav-collection + de... | 66% | 72% | 32% | 76% | 72% | 12% | 34% | 66% | 54% |
 
 <details><summary>Deathmatch ITEM % over time</summary>
@@ -68,7 +67,6 @@ commit `cebe166`  ⚠️ working tree dirty · rig: 8×90.0s game, solo 1 bot / 
 | Date | Note | q2dm1 | q2dm2 | q2dm3 | q2dm4 | q2dm5 | q2dm6 | q2dm7 | q2dm8 | mean |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 2026-07-12 | normalized baseline: all 8 maps cold-... | 35% | 59% | 28% | 60% | 57% | 19% | 39% | 44% | 43% |
-| 2026-07-12 | bot_aimprec default ON: demo-calibrat... | 36% | 53% | 26% | 61% | 57% | 20% | 38% | 46% | 42% |
 | 2026-07-12 | dual metric: solo nav-collection + de... | 36% | 53% | 26% | 61% | 57% | 20% | 38% | 46% | 42% |
 
 </details>
@@ -78,7 +76,6 @@ commit `cebe166`  ⚠️ working tree dirty · rig: 8×90.0s game, solo 1 bot / 
 | Date | Note | q2dm1 | q2dm2 | q2dm3 | q2dm4 | q2dm5 | q2dm6 | q2dm7 | q2dm8 | total |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 2026-07-12 | normalized baseline: all 8 maps cold-... | 97 | 69 | 5 | 16 | 39 | 9 | 23 | 109 | 367 |
-| 2026-07-12 | bot_aimprec default ON: demo-calibrat... | 84 | 67 | 5 | 16 | 49 | 3 | 18 | 97 | 339 |
 | 2026-07-12 | dual metric: solo nav-collection + de... | 84 | 67 | 5 | 16 | 49 | 3 | 18 | 97 | 339 |
 
 </details>
